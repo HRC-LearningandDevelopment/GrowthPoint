@@ -1,0 +1,603 @@
+// L&D Dashboard: overall, by program, by learner and by step, for a chosen period,
+// with Excel and PDF exports of exactly what's on screen.
+import { sb } from "../supabase.js";
+import {
+  esc, toast, icons, fmtDate, statusPill, PROGRAM_TYPE, PROGRAM_STATUS, STEP_TYPE,
+  LIBS, loadScript, safeName,
+} from "../ui.js";
+
+const PERIODS = { week: "This Week", month: "This Month", quarter: "This Quarter", year: "This Year", all: "All Time" };
+const filters = { period: "month", program: "", type: "", view: "programs", q: "" };
+const DAY = 86400000;
+const today = () => new Date().toLocaleDateString("en-CA"); // 2026-11-04, local time
+
+// ---------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------
+// Supabase returns at most 1,000 rows per request, so read in pages
+async function all(build) {
+  const rows = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build().range(from, from + 999);
+    if (error) throw error;
+    rows.push(...data);
+    if (data.length < 1000) return rows;
+  }
+}
+
+async function loadData() {
+  const [programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads] = await Promise.all([
+    all(() => sb.from("programs").select("id, title, program_type, status, start_date, due_date, owner:profiles!programs_owner_id_fkey(full_name)").order("title")),
+    all(() => sb.from("enrollments").select("id, program_id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active)")),
+    all(() => sb.from("v_enrollment_progress").select("*")),
+    all(() => sb.from("program_steps").select("id, program_id, position, step_type, title, is_required, passing_score").order("position")),
+    all(() => sb.from("step_progress").select("enrollment_id, step_id, status, score, started_at, completed_at")),
+    all(() => sb.from("assessment_attempts").select("enrollment_id, step_id, score, max_score, percent, passed, submitted_at")),
+    all(() => sb.from("uploads").select("enrollment_id, step_id, file_name, status, uploaded_at, reviewed_at, review_comment, reviewer:profiles!uploads_reviewed_by_fkey(full_name)")),
+    all(() => sb.from("message_threads").select("id, program_id, status")),
+  ]);
+  return { programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads };
+}
+
+function periodStart(key) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  if (key === "week") {
+    const d = new Date(y, m, now.getDate());
+    d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // Monday
+    return d;
+  }
+  if (key === "month") return new Date(y, m, 1);
+  if (key === "quarter") return new Date(y, Math.floor(m / 3) * 3, 1);
+  if (key === "year") return new Date(y, 0, 1);
+  return null;
+}
+
+// Everything the screen, the Excel file and the PDF show, worked out once
+function compute(d) {
+  const start = periodStart(filters.period);
+  const inPeriod = (v) => v && (!start || new Date(v) >= start);
+  const today = new Date(new Date().toDateString());
+
+  const programs = d.programs.filter((p) =>
+    (filters.program ? p.id === filters.program : p.status !== "archived") &&
+    (!filters.type || p.program_type === filters.type));
+  const programById = Object.fromEntries(programs.map((p) => [p.id, p]));
+  const enrollments = d.enrollments.filter((e) => programById[e.program_id]);
+  const enrollmentById = Object.fromEntries(enrollments.map((e) => [e.id, e]));
+  const pctByEnrollment = Object.fromEntries(d.progress.map((p) => [p.enrollment_id, p]));
+  const steps = d.steps.filter((s) => programById[s.program_id]);
+  const stepById = Object.fromEntries(steps.map((s) => [s.id, s]));
+  const stepProgress = d.stepProgress.filter((p) => enrollmentById[p.enrollment_id]);
+  const attempts = d.attempts.filter((a) => enrollmentById[a.enrollment_id]);
+  const uploads = d.uploads.filter((u) => enrollmentById[u.enrollment_id]);
+
+  // --- Learners (one row per enrolment) ---
+  const learners = enrollments.map((e) => {
+    const p = pctByEnrollment[e.id] ?? {};
+    const program = programById[e.program_id];
+    const pct = Math.round(Number(p.percent_complete ?? 0));
+    const due = e.due_date_override ?? program.due_date;
+    const dueMs = due ? new Date(`${due}T23:59:59`).getTime() : null;
+    const scores = stepProgress.filter((s) => s.enrollment_id === e.id && s.score != null).map((s) => Number(s.score));
+    const status = pct === 100 ? "Completed"
+      : dueMs && dueMs < today.getTime() ? "Overdue"
+      : dueMs && dueMs - Date.now() <= 7 * DAY ? "Due Soon"
+      : stepProgress.some((s) => s.enrollment_id === e.id) ? "In Progress" : "Not Started";
+    return {
+      name: e.learner.full_name, email: e.learner.email, program: program.title, programId: program.id,
+      pct, done: p.completed_steps ?? 0, total: p.required_steps ?? 0, due, status,
+      avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+      lastActivity: p.last_activity, extended: !!e.due_date_override,
+    };
+  }).sort((a, b) => a.program.localeCompare(b.program) || a.name.localeCompare(b.name));
+
+  // --- Programs ---
+  const programRows = programs.map((p) => {
+    const rows = learners.filter((l) => l.programId === p.id);
+    const scores = rows.map((r) => r.avgScore).filter((v) => v != null);
+    return {
+      id: p.id, title: p.title, type: PROGRAM_TYPE[p.program_type], status: p.status, owner: p.owner?.full_name ?? "",
+      due: p.due_date, learners: rows.length,
+      avgPct: rows.length ? Math.round(rows.reduce((a, r) => a + r.pct, 0) / rows.length) : 0,
+      completed: rows.filter((r) => r.status === "Completed").length,
+      overdue: rows.filter((r) => r.status === "Overdue").length,
+      avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+    };
+  });
+
+  // --- Steps (module-wise) ---
+  const stepRows = steps.map((s) => {
+    const enrolled = enrollments.filter((e) => e.program_id === s.program_id).length;
+    const prog = stepProgress.filter((p) => p.step_id === s.id);
+    const done = prog.filter((p) => p.status === "completed");
+    const scores = prog.filter((p) => p.score != null).map((p) => Number(p.score));
+    const tried = new Set(attempts.filter((a) => a.step_id === s.id).map((a) => a.enrollment_id));
+    const passed = new Set(attempts.filter((a) => a.step_id === s.id && a.passed).map((a) => a.enrollment_id));
+    return {
+      program: programById[s.program_id].title, position: s.position, title: s.title, type: STEP_TYPE[s.step_type].short,
+      required: s.is_required, enrolled, completed: done.length,
+      rate: enrolled ? Math.round((done.length / enrolled) * 100) : 0,
+      avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+      passRate: tried.size ? Math.round((passed.size / tried.size) * 100) : null,
+      pending: uploads.filter((u) => u.step_id === s.id && u.status === "pending").length,
+    };
+  });
+
+  // --- Period activity ---
+  const completedInPeriod = stepProgress.filter((p) => p.status === "completed" && inPeriod(p.completed_at));
+  const attemptsInPeriod = attempts.filter((a) => inPeriod(a.submitted_at));
+  const learnersFinishedInPeriod = learners.filter((l) => l.status === "Completed" && inPeriod(l.lastActivity)).length;
+
+  const kpis = [
+    { label: "Live Programs", value: programs.filter((p) => p.status === "live").length, hint: `${programs.length} in view` },
+    { label: "Learners Enrolled", value: new Set(enrollments.map((e) => e.learner_id)).size, hint: `${enrollments.length} enrolment${enrollments.length === 1 ? "" : "s"}` },
+    { label: "Average Completion", value: `${learners.length ? Math.round(learners.reduce((a, l) => a + l.pct, 0) / learners.length) : 0}%`, hint: "across all enrolments" },
+    { label: "Programs Completed", value: learners.filter((l) => l.status === "Completed").length, hint: `${learnersFinishedInPeriod} finished ${PERIODS[filters.period].toLowerCase()}` },
+    { label: "Steps Completed", value: completedInPeriod.length, hint: PERIODS[filters.period] },
+    { label: "Average Assessment Score", value: attemptsInPeriod.length ? `${Math.round(attemptsInPeriod.reduce((a, t) => a + Number(t.percent), 0) / attemptsInPeriod.length)}%` : "–",
+      hint: attemptsInPeriod.length ? `${Math.round((attemptsInPeriod.filter((t) => t.passed).length / attemptsInPeriod.length) * 100)}% pass rate, ${attemptsInPeriod.length} attempts` : `No attempts ${PERIODS[filters.period].toLowerCase()}` },
+    { label: "Overdue Learners", value: learners.filter((l) => l.status === "Overdue").length, hint: `${learners.filter((l) => l.status === "Due Soon").length} due within 7 days`, tone: "crit" },
+    { label: "Waiting For Review", value: uploads.filter((u) => u.status === "pending").length, hint: `${d.threads.filter((t) => t.status === "open" && (!t.program_id || programById[t.program_id])).length} open messages`, tone: "warn" },
+  ];
+
+  const trend = buckets(completedInPeriod.map((p) => p.completed_at), start);
+
+  // Raw lists for the Excel file
+  const attemptRows = attempts.map((a) => {
+    const e = enrollmentById[a.enrollment_id];
+    return { learner: e.learner.full_name, email: e.learner.email, program: programById[e.program_id].title,
+      step: stepById[a.step_id]?.title ?? "", percent: Number(a.percent), passed: a.passed, submitted: a.submitted_at };
+  }).sort((a, b) => new Date(b.submitted) - new Date(a.submitted));
+  const uploadRows = uploads.map((u) => {
+    const e = enrollmentById[u.enrollment_id];
+    return { learner: e.learner.full_name, email: e.learner.email, program: programById[e.program_id].title,
+      step: stepById[u.step_id]?.title ?? "", file: u.file_name, status: { pending: "Waiting For Review", approved: "Approved", rejected: "Returned" }[u.status],
+      uploaded: u.uploaded_at, reviewedBy: u.reviewer?.full_name ?? "", reviewed: u.reviewed_at, comment: u.review_comment ?? "" };
+  });
+
+  return { kpis, trend, programRows, learners, stepRows, attemptRows, uploadRows, start };
+}
+
+// Count completions per day / week / month, depending on the period
+function buckets(dates, start) {
+  const now = new Date();
+  const out = [];
+  const key = (d, unit) => unit === "month" ? `${d.getFullYear()}-${d.getMonth()}` : new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  let unit = "day";
+  let first = start;
+  if (filters.period === "quarter") unit = "week";
+  if (filters.period === "year" || filters.period === "all") unit = "month";
+  if (!first) {
+    const earliest = dates.length ? new Date(Math.min(...dates.map((x) => new Date(x).getTime()))) : now;
+    first = new Date(earliest.getFullYear(), earliest.getMonth(), 1);
+    if ((now.getFullYear() - first.getFullYear()) * 12 + now.getMonth() - first.getMonth() > 23) first = new Date(now.getFullYear(), now.getMonth() - 23, 1);
+  }
+  // Show the whole period (later days/weeks/months simply show zero)
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const end = {
+    week: new Date(first.getFullYear(), first.getMonth(), first.getDate() + 7),
+    month: new Date(y, m + 1, 1),
+    quarter: new Date(y, Math.floor(m / 3) * 3 + 3, 1),
+    year: new Date(y + 1, 0, 1),
+  }[filters.period] ?? new Date(y, m + 1, 1);
+  const cursor = new Date(first);
+  while (cursor < end) {
+    let label;
+    let next;
+    if (unit === "day") {
+      label = cursor.toLocaleDateString(undefined, filters.period === "week" ? { weekday: "short" } : { day: "numeric" });
+      next = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
+    } else if (unit === "week") {
+      label = cursor.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+      next = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 7);
+    } else {
+      label = cursor.toLocaleDateString(undefined, { month: "short", ...(filters.period === "all" ? { year: "2-digit" } : {}) });
+      next = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+    }
+    const from = cursor.getTime();
+    const to = next.getTime();
+    out.push({ label, value: dates.filter((x) => { const t = new Date(x).getTime(); return t >= from && t < to; }).length });
+    cursor.setTime(to);
+  }
+  return { unit, points: out };
+}
+
+// ---------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------
+export async function renderDashboard(main, ctx) {
+  main.innerHTML = `
+    <header class="topbar">
+      <div><h1>Dashboard</h1><p>Progress, completions and scores across your programs.</p></div>
+      <div class="top-actions">
+        <button class="btn" data-excel>${icons.download} Export Excel</button>
+        <button class="btn primary" data-pdf>${icons.download} PDF Report</button>
+      </div>
+    </header>
+    <div class="toolbar">
+      <div class="seg" role="group" aria-label="Period">
+        ${Object.entries(PERIODS).map(([k, l]) => `<button type="button" data-period="${k}" class="${k === filters.period ? "on" : ""}">${l}</button>`).join("")}
+      </div>
+      <select class="select" data-f="program"><option value="">All Programs (Not Archived)</option></select>
+      <select class="select" data-f="type">
+        <option value="">All Types</option>
+        ${Object.entries(PROGRAM_TYPE).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}
+      </select>
+    </div>
+    <div id="dash"><div class="empty"><div>Loading…</div></div></div>`;
+
+  let data;
+  try {
+    data = await loadData();
+  } catch (err) {
+    main.querySelector("#dash").innerHTML = `<div class="empty"><div><strong>Couldn't Load The Dashboard</strong>${esc(err.message)}</div></div>`;
+    return;
+  }
+
+  const programSelect = main.querySelector('[data-f="program"]');
+  programSelect.insertAdjacentHTML("beforeend", data.programs.map((p) =>
+    `<option value="${p.id}">${esc(p.title)}${p.status === "archived" ? " (Archived)" : ""}</option>`).join(""));
+  programSelect.value = data.programs.some((p) => p.id === filters.program) ? filters.program : "";
+  main.querySelector('[data-f="type"]').value = filters.type;
+
+  let view;
+  const draw = () => {
+    view = compute(data);
+    drawDashboard(main.querySelector("#dash"), view);
+  };
+  main.querySelectorAll("[data-f]").forEach((el) => el.addEventListener("input", () => { filters[el.dataset.f] = el.value; draw(); }));
+  main.querySelectorAll("[data-period]").forEach((b) => b.addEventListener("click", () => {
+    filters.period = b.dataset.period;
+    main.querySelectorAll("[data-period]").forEach((x) => x.classList.toggle("on", x === b));
+    draw();
+  }));
+  main.querySelector("[data-excel]").addEventListener("click", (e) => runExport(e.currentTarget, () => exportExcel(view, data, ctx.me)));
+  main.querySelector("[data-pdf]").addEventListener("click", (e) => runExport(e.currentTarget, () => exportPdf(view, data, ctx.me)));
+  draw();
+}
+
+async function runExport(btn, fn) {
+  const label = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = "Preparing…";
+  try { await fn(); } catch (err) { toast(err.message, "err"); } finally { btn.disabled = false; btn.innerHTML = label; }
+}
+
+const STATUS_PILL = { Completed: "good", Overdue: "crit", "Due Soon": "warn", "In Progress": "prog", "Not Started": "" };
+const pct = (v) => (v == null ? '<span class="muted">–</span>' : `${v}%`);
+const meter = (v) => `<div class="meter"><i style="width:${v}%"></i></div> ${v}%`;
+
+function drawDashboard(box, v) {
+  const max = Math.max(1, ...v.trend.points.map((p) => p.value));
+  const unitWord = { day: "day", week: "week", month: "month" }[v.trend.unit];
+  box.innerHTML = `
+    <div class="kpi-grid">
+      ${v.kpis.map((k) => `
+        <div class="card kpi ${k.tone ?? ""}">
+          <span class="label">${esc(k.label)}</span>
+          <b>${esc(k.value)}</b>
+          <span class="muted small">${esc(k.hint)}</span>
+        </div>`).join("")}
+    </div>
+
+    <div class="chart-grid">
+      <div class="card">
+        <div class="card-head"><h2>Steps Completed</h2><span class="muted small">${esc(PERIODS[filters.period])}, by ${unitWord}</span></div>
+        <div class="bars" style="--n:${v.trend.points.length}">
+          ${v.trend.points.map((p) => `
+            <div class="bar" title="${esc(p.label)}: ${p.value}">
+              <span class="bar-value">${p.value || ""}</span>
+              <i style="height:${(p.value / max) * 100}%"></i>
+              <span class="bar-label">${esc(p.label)}</span>
+            </div>`).join("")}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Completion By Program</h2><span class="muted small">Average of all learners</span></div>
+        ${v.programRows.length ? `<div class="hbars">${v.programRows.map((p) => `
+          <div class="hbar"><span class="hbar-label" title="${esc(p.title)}">${esc(p.title)}</span>
+            <div class="hbar-track"><i style="width:${p.avgPct}%"></i></div><b>${p.avgPct}%</b></div>`).join("")}</div>`
+          : '<p class="muted">No programs in view.</p>'}
+      </div>
+    </div>
+
+    <div class="tabs" style="margin-top:18px">
+      ${[["programs", "By Program"], ["learners", "By Learner"], ["steps", "By Step"]].map(([k, l]) =>
+        `<a href="#" data-view="${k}" class="${filters.view === k ? "active" : ""}">${l}</a>`).join("")}
+    </div>
+    <div id="dash-table"></div>`;
+
+  box.querySelectorAll("[data-view]").forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    filters.view = a.dataset.view;
+    box.querySelectorAll("[data-view]").forEach((x) => x.classList.toggle("active", x === a));
+    drawTable(box.querySelector("#dash-table"), v);
+  }));
+  drawTable(box.querySelector("#dash-table"), v);
+}
+
+function drawTable(el, v) {
+  if (filters.view === "programs") {
+    el.innerHTML = v.programRows.length ? `
+      <div class="table-wrap"><table class="data clickable">
+        <thead><tr><th>Program</th><th>Type</th><th>Status</th><th>Learners</th><th>Avg. Completion</th><th>Completed</th><th>Overdue</th><th>Avg. Score</th><th>Due Date</th></tr></thead>
+        <tbody>${v.programRows.map((p) => `
+          <tr data-open="${p.id}"><td class="name"><strong>${esc(p.title)}</strong><span>${esc(p.owner)}</span></td>
+            <td>${esc(p.type)}</td><td>${statusPill(p.status)}</td><td>${p.learners}</td><td>${meter(p.avgPct)}</td>
+            <td>${p.completed}</td><td>${p.overdue ? `<span class="pill crit">${p.overdue}</span>` : 0}</td><td>${pct(p.avgScore)}</td>
+            <td>${esc(fmtDate(p.due))}</td></tr>`).join("")}</tbody>
+      </table></div>` : '<div class="empty"><div><strong>No Programs In View</strong>Change the filters above.</div></div>';
+    el.querySelector("tbody")?.addEventListener("click", (e) => {
+      const row = e.target.closest("[data-open]");
+      if (row) location.hash = `#/programs/${row.dataset.open}/learners`;
+    });
+    return;
+  }
+
+  if (filters.view === "learners") {
+    el.innerHTML = `
+      <div class="toolbar"><input class="input search" type="search" placeholder="Search learner" value="${esc(filters.q)}" data-q><span class="count"></span></div>
+      <div data-rows></div>`;
+    const rows = el.querySelector("[data-rows]");
+    const drawRows = () => {
+      const q = filters.q.trim().toLowerCase();
+      const shown = v.learners.filter((l) => !q || `${l.name} ${l.email} ${l.program}`.toLowerCase().includes(q));
+      el.querySelector(".count").textContent = `${shown.length} of ${v.learners.length}`;
+      rows.innerHTML = shown.length ? `
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>Learner</th><th>Program</th><th>Progress</th><th>Status</th><th>Due Date</th><th>Avg. Score</th><th>Last Activity</th></tr></thead>
+          <tbody>${shown.map((l) => `
+            <tr><td class="name"><strong>${esc(l.name)}</strong><span>${esc(l.email)}</span></td>
+              <td>${esc(l.program)}</td><td>${meter(l.pct)} <span class="muted small">(${l.done}/${l.total})</span></td>
+              <td><span class="pill ${STATUS_PILL[l.status]}">${l.status}</span></td>
+              <td>${esc(fmtDate(l.due))}${l.extended ? ' <span class="pill warn">Extended</span>' : ""}</td>
+              <td>${pct(l.avgScore)}</td><td>${esc(fmtDate(l.lastActivity))}</td></tr>`).join("")}</tbody>
+        </table></div>` : '<div class="empty"><div><strong>No Learners In View</strong>Enroll learners in a program first.</div></div>';
+    };
+    el.querySelector("[data-q]").addEventListener("input", (e) => { filters.q = e.target.value; drawRows(); });
+    drawRows();
+    return;
+  }
+
+  el.innerHTML = v.stepRows.length ? `
+    <div class="table-wrap"><table class="data">
+      <thead><tr><th>Program</th><th>Step</th><th>Type</th><th>Completed</th><th>Completion Rate</th><th>Avg. Score</th><th>Pass Rate</th><th>Waiting For Review</th></tr></thead>
+      <tbody>${v.stepRows.map((s) => `
+        <tr><td>${esc(s.program)}</td><td class="name"><strong>${s.position}. ${esc(s.title)}</strong>${s.required ? "" : "<span>Optional</span>"}</td>
+          <td>${esc(s.type)}</td><td>${s.completed} / ${s.enrolled}</td><td>${meter(s.rate)}</td>
+          <td>${pct(s.avgScore)}</td><td>${pct(s.passRate)}</td><td>${s.pending || ""}</td></tr>`).join("")}</tbody>
+    </table></div>` : '<div class="empty"><div><strong>No Steps In View</strong>Add steps to a program’s learning journey.</div></div>';
+}
+
+// ---------------------------------------------------------------------
+// Excel
+// ---------------------------------------------------------------------
+function filterSummary(data) {
+  const program = data.programs.find((p) => p.id === filters.program);
+  return [
+    ["Period", PERIODS[filters.period]],
+    ["Program", program ? program.title : "All Programs (Not Archived)"],
+    ["Type", filters.type ? PROGRAM_TYPE[filters.type] : "All Types"],
+  ];
+}
+
+const xDate = (v) => (v ? new Date(/^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T00:00:00` : v) : "");
+
+async function exportExcel(v, data, me) {
+  await loadScript(LIBS.xlsx);
+  const X = window.XLSX;
+  const wb = X.utils.book_new();
+  const sheet = (name, rows, widths) => {
+    const ws = Array.isArray(rows[0]) ? X.utils.aoa_to_sheet(rows, { cellDates: true }) : X.utils.json_to_sheet(rows, { cellDates: true });
+    ws["!cols"] = widths.map((w) => ({ wch: w }));
+    X.utils.book_append_sheet(wb, ws, name);
+  };
+
+  sheet("Summary", [
+    ["L&D Learning Report"],
+    ["Generated", new Date(), "By", me.full_name],
+    [],
+    ...filterSummary(data),
+    [],
+    ["Measure", "Value", "Detail"],
+    ...v.kpis.map((k) => [k.label, k.value, k.hint]),
+  ], [28, 22, 40, 24]);
+
+  sheet("Programs", v.programRows.map((p) => ({
+    Program: p.title, Type: p.type, Status: PROGRAM_STATUS[p.status].label, Owner: p.owner, "Due Date": xDate(p.due),
+    Learners: p.learners, "Average Completion %": p.avgPct, Completed: p.completed, Overdue: p.overdue, "Average Score %": p.avgScore ?? "",
+  })), [34, 12, 12, 22, 12, 10, 20, 11, 9, 16]);
+
+  sheet("Learners", v.learners.map((l) => ({
+    Learner: l.name, Email: l.email, Program: l.program, "Completion %": l.pct, "Steps Done": l.done, "Steps Required": l.total,
+    Status: l.status, "Due Date": xDate(l.due), "Deadline Extended": l.extended ? "Yes" : "No",
+    "Average Score %": l.avgScore ?? "", "Last Activity": xDate(l.lastActivity),
+  })), [26, 32, 32, 13, 11, 14, 13, 12, 17, 16, 18]);
+
+  sheet("Steps", v.stepRows.map((s) => ({
+    Program: s.program, "#": s.position, Step: s.title, Type: s.type, Required: s.required ? "Yes" : "No",
+    Enrolled: s.enrolled, Completed: s.completed, "Completion Rate %": s.rate, "Average Score %": s.avgScore ?? "",
+    "Pass Rate %": s.passRate ?? "", "Waiting For Review": s.pending,
+  })), [32, 4, 36, 14, 9, 9, 10, 17, 16, 12, 18]);
+
+  sheet("Assessment Attempts", v.attemptRows.length ? v.attemptRows.map((a) => ({
+    Learner: a.learner, Email: a.email, Program: a.program, Assessment: a.step, "Score %": a.percent,
+    Result: a.passed ? "Passed" : "Not Passed", Submitted: xDate(a.submitted),
+  })) : [["No assessment attempts yet."]], [26, 32, 32, 32, 9, 12, 18]);
+
+  sheet("Uploads", v.uploadRows.length ? v.uploadRows.map((u) => ({
+    Learner: u.learner, Email: u.email, Program: u.program, Step: u.step, File: u.file, Status: u.status,
+    Uploaded: xDate(u.uploaded), "Reviewed By": u.reviewedBy, Reviewed: xDate(u.reviewed), Comment: u.comment,
+  })) : [["No uploads yet."]], [26, 32, 32, 30, 30, 18, 18, 20, 18, 40]);
+
+  X.writeFile(wb, `L and D Learning Report ${today()}.xlsx`);
+  toast("Excel file downloaded.");
+}
+
+// ---------------------------------------------------------------------
+// PDF report (A4, corporate layout)
+// ---------------------------------------------------------------------
+const NAVY = [18, 48, 77];
+const TEAL = [79, 179, 184];
+const SKY = [42, 127, 192];
+const INK = [22, 50, 74];
+const MUTED = [91, 111, 130];
+const LINE = [223, 231, 238];
+
+async function exportPdf(v, data, me) {
+  await loadScript(LIBS.jspdf);
+  await loadScript(LIBS.autotable);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const W = doc.internal.pageSize.getWidth();
+  const M = 40;
+  const program = data.programs.find((p) => p.id === filters.program);
+  const scope = program ? program.title : "All Programs";
+  const generated = new Date().toLocaleString(undefined, { day: "numeric", month: "long", year: "numeric", hour: "numeric", minute: "2-digit" });
+
+  // Header band
+  doc.setFillColor(...NAVY);
+  doc.rect(0, 0, W, 112, "F");
+  const stripe = [SKY, TEAL, [109, 181, 158]];
+  stripe.forEach((c, i) => { doc.setFillColor(...c); doc.rect((W / 3) * i, 112, W / 3 + 1, 4, "F"); });
+  doc.setTextColor(255, 255, 255);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(22);
+  doc.text("L&D Learning Report", M, 52);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(11);
+  doc.setTextColor(200, 220, 232);
+  doc.text(`${scope}  |  ${PERIODS[filters.period]}${filters.type ? `  |  ${PROGRAM_TYPE[filters.type]}` : ""}`, M, 74);
+  doc.text(`Generated ${generated} by ${me.full_name}`, M, 92);
+
+  // KPI tiles (4 x 2)
+  let y = 140;
+  const gap = 10;
+  const tileW = (W - M * 2 - gap * 3) / 4;
+  const tileH = 64;
+  v.kpis.forEach((k, i) => {
+    const x = M + (i % 4) * (tileW + gap);
+    const ty = y + Math.floor(i / 4) * (tileH + gap);
+    doc.setFillColor(246, 249, 251);
+    doc.setDrawColor(...LINE);
+    doc.roundedRect(x, ty, tileW, tileH, 6, 6, "FD");
+    doc.setFillColor(...(k.tone === "crit" ? [208, 80, 74] : k.tone === "warn" ? [230, 165, 50] : TEAL));
+    doc.rect(x, ty + 6, 3, tileH - 12, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7.5);
+    doc.setTextColor(...MUTED);
+    doc.text(doc.splitTextToSize(k.label, tileW - 18)[0], x + 12, ty + 17);
+    doc.setFontSize(18);
+    doc.setTextColor(...INK);
+    doc.text(String(k.value), x + 12, ty + 40);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(...MUTED);
+    doc.text(doc.splitTextToSize(k.hint, tileW - 18)[0], x + 12, ty + 54);
+  });
+  y += tileH * 2 + gap + 28;
+
+  // Chart: steps completed over time
+  const sectionTitle = (title, sub, at) => {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(...INK);
+    doc.text(title, M, at);
+    if (sub) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8.5);
+      doc.setTextColor(...MUTED);
+      doc.text(sub, W - M, at, { align: "right" });
+    }
+  };
+  sectionTitle("Steps Completed", `${PERIODS[filters.period]}, by ${v.trend.unit}`, y);
+  y += 12;
+  const chartH = 130;
+  const chartW = W - M * 2;
+  const pts = v.trend.points;
+  const max = Math.max(1, ...pts.map((p) => p.value));
+  const slot = chartW / Math.max(1, pts.length);
+  doc.setDrawColor(...LINE);
+  doc.line(M, y + chartH, M + chartW, y + chartH);
+  const labelEvery = Math.ceil(pts.length / 16);
+  pts.forEach((p, i) => {
+    const h = (p.value / max) * (chartH - 18);
+    const bx = M + i * slot + slot * 0.18;
+    const bw = slot * 0.64;
+    doc.setFillColor(...TEAL);
+    if (h > 0) doc.rect(bx, y + chartH - h, bw, h, "F");
+    doc.setFontSize(7);
+    if (p.value) { doc.setTextColor(...INK); doc.text(String(p.value), bx + bw / 2, y + chartH - h - 3, { align: "center" }); }
+    if (i % labelEvery === 0) { doc.setTextColor(...MUTED); doc.text(p.label, bx + bw / 2, y + chartH + 10, { align: "center" }); }
+  });
+  y += chartH + 34;
+
+  // Chart: completion by program
+  sectionTitle("Completion By Program", "Average of all learners", y);
+  y += 14;
+  const rows = v.programRows.slice(0, 12);
+  if (!rows.length) {
+    doc.setFontSize(9);
+    doc.setTextColor(...MUTED);
+    doc.text("No programs in view.", M, y + 10);
+    y += 20;
+  }
+  rows.forEach((p) => {
+    if (y > 790) { doc.addPage(); y = 50; }
+    doc.setFontSize(8.5);
+    doc.setTextColor(...INK);
+    doc.text(doc.splitTextToSize(p.title, 150)[0], M, y + 8);
+    doc.setFillColor(237, 242, 246);
+    doc.rect(M + 160, y, chartW - 200, 10, "F");
+    doc.setFillColor(...SKY);
+    if (p.avgPct) doc.rect(M + 160, y, (chartW - 200) * (p.avgPct / 100), 10, "F");
+    doc.setFont("helvetica", "bold");
+    doc.text(`${p.avgPct}%`, W - M, y + 8, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    y += 18;
+  });
+
+  // Tables
+  const table = (title, head, body, columnStyles = {}) => {
+    doc.addPage();
+    sectionTitle(title, `${scope}  |  ${PERIODS[filters.period]}`, 50);
+    doc.autoTable({
+      startY: 62, head: [head], body: body.length ? body : [[{ content: "Nothing to show yet.", colSpan: head.length }]],
+      margin: { left: M, right: M, bottom: 50 },
+      styles: { font: "helvetica", fontSize: 8, cellPadding: 5, textColor: INK, lineColor: LINE, lineWidth: 0.5 },
+      headStyles: { fillColor: NAVY, textColor: 255, fontStyle: "bold" },
+      alternateRowStyles: { fillColor: [246, 249, 251] },
+      columnStyles,
+    });
+  };
+  const fmt = (n) => (n == null ? "–" : `${n}%`);
+  table("Programs", ["Program", "Type", "Status", "Learners", "Avg. Completion", "Completed", "Overdue", "Avg. Score"],
+    v.programRows.map((p) => [p.title, p.type, PROGRAM_STATUS[p.status].label, p.learners, `${p.avgPct}%`, p.completed, p.overdue, fmt(p.avgScore)]),
+    { 0: { cellWidth: 150 } });
+  table("Learners", ["Learner", "Program", "Progress", "Status", "Due Date", "Avg. Score", "Last Activity"],
+    v.learners.map((l) => [`${l.name}\n${l.email}`, l.program, `${l.pct}% (${l.done}/${l.total})`, l.status, fmtDate(l.due), fmt(l.avgScore), fmtDate(l.lastActivity)]),
+    { 0: { cellWidth: 130 } });
+  table("Steps", ["Program", "Step", "Type", "Completed", "Rate", "Avg. Score", "Pass Rate"],
+    v.stepRows.map((s) => [s.program, `${s.position}. ${s.title}`, s.type, `${s.completed} / ${s.enrolled}`, `${s.rate}%`, fmt(s.avgScore), fmt(s.passRate)]),
+    { 1: { cellWidth: 150 } });
+
+  // Footer on every page
+  const pages = doc.internal.getNumberOfPages();
+  for (let i = 1; i <= pages; i++) {
+    doc.setPage(i);
+    const H = doc.internal.pageSize.getHeight();
+    doc.setDrawColor(...LINE);
+    doc.line(M, H - 32, W - M, H - 32);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(...MUTED);
+    doc.text("L&D Learning Companion  |  Confidential: For Internal Use", M, H - 20);
+    doc.text(`Page ${i} of ${pages}`, W - M, H - 20, { align: "right" });
+  }
+
+  doc.save(`${safeName(`L and D Learning Report - ${scope} - ${today()}`)}.pdf`);
+  toast("PDF report downloaded.");
+}
