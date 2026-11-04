@@ -350,12 +350,15 @@ async function closeAndArchive(program, reload) {
       "Available From": d(s.unlock_at), Due: d(s.due_at), "Session Start": d(s.session_start), "Pass Mark %": s.passing_score ?? "", "Final Screen Words": s.completion_text ?? "",
       Link: linkOf(s), Instructions: s.description ?? "",
     })), [4, 34, 14, 9, 18, 18, 18, 11, 40, 40]);
+    const { data: exclusions } = ids.length ? await sb.from("enrollment_exclusions").select("enrollment_id, step_id").in("enrollment_id", ids) : { data: [] };
+    const removedFor = (id) => new Set((exclusions ?? []).filter((x) => x.enrollment_id === id).map((x) => x.step_id));
     add("Learners", enrolled.map((e) => ({
       Learner: e.learner.full_name, Email: e.learner.email, "Completion %": Math.round(Number(pctBy[e.id]?.percent_complete ?? 0)),
       "Steps Done": pctBy[e.id]?.completed_steps ?? 0, "Steps Required": pctBy[e.id]?.required_steps ?? 0,
       "Due Date": d(e.due_date_override ?? program.due_date), Enrolled: d(e.enrolled_at),
       "Watched Welcome Video": d(e.welcome_completed_at), "Read Required Reading": d(e.reading_ack_at),
-    })), [26, 32, 13, 11, 14, 12, 18, 22, 22]);
+      "Steps Assigned": removedFor(e.id).size ? steps.filter((s) => !removedFor(e.id).has(s.id)).map((s) => s.title).join("; ") : "All",
+    })), [26, 32, 13, 11, 14, 12, 18, 22, 22, 50]);
     add("Step Progress", progress.map((p) => ({
       Learner: who(p.enrollment_id).full_name, Email: who(p.enrollment_id).email, Step: stepById[p.step_id]?.title ?? "",
       Status: { not_started: "Not Started", in_progress: "In Progress", submitted: "Submitted", completed: "Completed", rejected: "Returned" }[p.status],
@@ -762,11 +765,15 @@ function editStep(program, step, steps, reload) {
 // Live sessions are completed when L&D records who attended
 async function markAttendance(program, step, reload) {
   const [{ data: enrolled, error }, { data: progress }] = await Promise.all([
-    sb.from("enrollments").select("id, learner:profiles(full_name, email)").eq("program_id", program.id),
+    sb.from("enrollments").select("id, learner:profiles(full_name, email), enrollment_exclusions(step_id)").eq("program_id", program.id),
     sb.from("step_progress").select("enrollment_id, status").eq("step_id", step.id),
   ]);
   if (error) return toast(error.message, "err");
   const attended = new Set((progress ?? []).filter((p) => p.status === "completed").map((p) => p.enrollment_id));
+  // Learners who had this session removed don't appear
+  for (let i = enrolled.length - 1; i >= 0; i--) {
+    if ((enrolled[i].enrollment_exclusions ?? []).some((x) => x.step_id === step.id)) enrolled.splice(i, 1);
+  }
   enrolled.sort((a, b) => a.learner.full_name.localeCompare(b.learner.full_name));
 
   const { form } = openModal({
@@ -835,11 +842,12 @@ function deleteStep(step, reload) {
 // Learners (enrolments)
 // =====================================================================
 async function learnersTab(area, program, reload) {
-  const [{ data: enrolled, error }, { data: progress }] = await Promise.all([
+  const [{ data: enrolled, error }, { data: progress }, { data: steps }] = await Promise.all([
     sb.from("enrollments")
-      .select("id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active)")
+      .select("id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active), enrollment_exclusions(step_id)")
       .eq("program_id", program.id),
     sb.from("v_enrollment_progress").select("enrollment_id, percent_complete, completed_steps, required_steps, last_activity").eq("program_id", program.id),
+    sb.from("program_steps").select("id, position, step_type, title, is_required").eq("program_id", program.id).order("position"),
   ]);
   if (error) {
     area.innerHTML = `<div class="empty"><div><strong>Couldn't Load Learners</strong>${esc(error.message)}</div></div>`;
@@ -864,10 +872,12 @@ async function learnersTab(area, program, reload) {
             return `
               <tr class="${e.learner.is_active ? "" : "inactive"}">
                 <td class="name"><strong>${esc(e.learner.full_name)}</strong><span>${esc(e.learner.email)}</span></td>
-                <td><div class="meter"><i style="width:${pct}%"></i></div> ${pct}% <span class="muted">(${p?.completed_steps ?? 0}/${p?.required_steps ?? 0})</span></td>
+                <td><div class="meter"><i style="width:${pct}%"></i></div> ${pct}% <span class="muted">(${p?.completed_steps ?? 0}/${p?.required_steps ?? 0})</span>
+                  ${e.enrollment_exclusions?.length ? `<div><span class="pill teal">Custom: ${(steps ?? []).length - e.enrollment_exclusions.length} Of ${(steps ?? []).length} Steps</span></div>` : ""}</td>
                 <td>${due ? esc(fmtDate(due)) : '<span class="muted">–</span>'} ${e.due_date_override ? '<span class="pill warn">Extended</span>' : ""}</td>
                 <td>${p?.last_activity ? esc(fmtDate(p.last_activity)) : ""}</td>
                 <td class="actions">
+                  <button class="btn sm" data-steps="${e.id}">Customize Steps</button>
                   <a class="btn sm" href="#/preview/${e.learner_id}/${program.id}">View As Learner</a>
                   <button class="btn sm" data-extend="${e.id}">Deadline</button>
                   <button class="btn sm ghost icon danger" data-remove="${e.id}" aria-label="Remove from program">${icons.trash}</button>
@@ -881,9 +891,62 @@ async function learnersTab(area, program, reload) {
   area.querySelector("tbody")?.addEventListener("click", (e) => {
     const ext = e.target.closest("[data-extend]");
     const rem = e.target.closest("[data-remove]");
+    const cus = e.target.closest("[data-steps]");
+    if (cus) customizeSteps(enrolled.find((x) => x.id === cus.dataset.steps), steps ?? [], reload);
     if (ext) extendDeadline(program, enrolled.find((x) => x.id === ext.dataset.extend), reload);
     if (rem) removeEnrollment(enrolled.find((x) => x.id === rem.dataset.remove), reload);
   });
+}
+
+// Choose which steps one learner must do (e.g. 1 of 3 modules). Removed steps
+// are hidden from them and don't count toward their completion.
+function customizeSteps(enrollment, steps, reload) {
+  const removed = new Set((enrollment.enrollment_exclusions ?? []).map((x) => x.step_id));
+  const { form } = openModal({
+    title: `Customize Steps: ${enrollment.learner.full_name}`,
+    intro: "Untick any step this learner doesn't need. They won't see it, and it won't count toward their completion. They stay in the program.",
+    wide: true,
+    body: steps.length ? `
+      <div class="toolbar" style="margin:0">
+        <label class="check"><input type="checkbox" data-all> Select All</label>
+        <span class="count" data-picked></span>
+      </div>
+      <div class="checklist">
+        ${steps.map((s) => `
+          <label class="check-row">
+            <input type="checkbox" value="${s.id}" ${removed.has(s.id) ? "" : "checked"}>
+            <span class="step-icon mini">${stepIcon(s.step_type)}</span>
+            <span><strong>${s.position}. ${esc(s.title)}</strong><span class="muted">${esc(STEP_TYPE[s.step_type].short)}${s.is_required ? "" : " · Optional"}</span></span>
+          </label>`).join("")}
+      </div>
+      <p class="muted small" style="margin:0">Any progress already made on a removed step is kept, and comes back if you add the step again.</p>`
+      : '<div class="empty"><div><strong>No Steps Yet</strong>Add steps on the Learning Journey tab first.</div></div>',
+    submitLabel: steps.length ? "Save Steps" : "",
+    cancelLabel: steps.length ? "Cancel" : "Close",
+    onSubmit: async (f) => {
+      const keep = new Set([...f.querySelectorAll(".checklist input:checked")].map((c) => c.value));
+      if (!keep.size) throw new Error("Keep at least one step. To take someone out of the program, use the bin button instead.");
+      const nowRemoved = steps.filter((s) => !keep.has(s.id)).map((s) => s.id);
+      const add = nowRemoved.filter((id) => !removed.has(id));
+      const back = [...removed].filter((id) => keep.has(id));
+      if (add.length) {
+        const { error } = await sb.from("enrollment_exclusions").insert(add.map((step_id) => ({ enrollment_id: enrollment.id, step_id })));
+        if (error) throw error;
+      }
+      if (back.length) {
+        const { error } = await sb.from("enrollment_exclusions").delete().eq("enrollment_id", enrollment.id).in("step_id", back);
+        if (error) throw error;
+      }
+      toast(nowRemoved.length ? `${enrollment.learner.full_name} now has ${keep.size} of ${steps.length} steps.` : `${enrollment.learner.full_name} has every step.`);
+      reload();
+    },
+  });
+  if (!steps.length) return;
+  const boxes = [...form.querySelectorAll(".checklist input")];
+  const count = () => { form.querySelector("[data-picked]").textContent = `${boxes.filter((b) => b.checked).length} of ${boxes.length} steps`; };
+  form.querySelector("[data-all]").addEventListener("change", (e) => { boxes.forEach((b) => { b.checked = e.target.checked; }); count(); });
+  form.querySelector(".checklist").addEventListener("change", count);
+  count();
 }
 
 async function enrollLearners(program, enrolled, reload) {

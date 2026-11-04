@@ -26,7 +26,7 @@ async function all(build) {
 }
 
 async function loadData() {
-  const [programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads] = await Promise.all([
+  const [programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads, exclusions, responses, scaleQs] = await Promise.all([
     all(() => sb.from("programs").select("id, title, program_type, status, start_date, due_date, owner:profiles!programs_owner_id_fkey(full_name)").order("title")),
     all(() => sb.from("enrollments").select("id, program_id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active)")),
     all(() => sb.from("v_enrollment_progress").select("*")),
@@ -35,8 +35,11 @@ async function loadData() {
     all(() => sb.from("assessment_attempts").select("enrollment_id, step_id, status, score, max_score, percent, passed, submitted_at")),
     all(() => sb.from("uploads").select("enrollment_id, step_id, file_name, status, uploaded_at, reviewed_at, review_comment, reviewer:profiles!uploads_reviewed_by_fkey(full_name)")),
     all(() => sb.from("message_threads").select("id, program_id, status")),
+    all(() => sb.from("enrollment_exclusions").select("enrollment_id, step_id")),
+    all(() => sb.from("survey_responses").select("step_id, answers, submitted_at")),
+    all(() => sb.from("assessment_questions").select("id, step_id, qtype").in("qtype", ["rating", "likert", "nps"])),
   ]);
-  return { programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads };
+  return { programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads, exclusions, responses, scaleQs };
 }
 
 function periodStart(key) {
@@ -53,6 +56,31 @@ function periodStart(key) {
   if (key === "year") return new Date(y, 0, 1);
   return null;
 }
+
+// Survey answers → average star rating (1–5), recommendation score (NPS, −100..100), % who agree
+function feedbackOf(responses, scaleQs) {
+  const ratings = [];
+  const nps = [];
+  const likert = [];
+  for (const r of responses) {
+    for (const q of scaleQs) {
+      if (q.step_id !== r.step_id) continue;
+      const v = r.answers?.[q.id];
+      if (v == null || v === "") continue;
+      if (q.qtype === "rating") ratings.push(Number(v));
+      if (q.qtype === "nps") nps.push(Number(v));
+      if (q.qtype === "likert") likert.push(Number(v));
+    }
+  }
+  return {
+    responses: responses.length,
+    rating: ratings.length ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10 : null,
+    nps: nps.length ? Math.round(((nps.filter((v) => v >= 9).length - nps.filter((v) => v <= 6).length) / nps.length) * 100) : null,
+    agree: likert.length ? Math.round((likert.filter((v) => v >= 3).length / likert.length) * 100) : null,
+  };
+}
+const fmtNps = (n) => (n == null ? "–" : `${n > 0 ? "+" : ""}${n}`);
+const fmtRating = (r) => (r == null ? "–" : `${r} / 5`);
 
 // Everything the screen, the Excel file and the PDF show, worked out once
 function compute(d) {
@@ -73,6 +101,10 @@ function compute(d) {
   // Finished attempts only (not ones still being taken)
   const attempts = d.attempts.filter((a) => enrollmentById[a.enrollment_id] && a.status !== "in_progress" && a.percent != null);
   const uploads = d.uploads.filter((u) => enrollmentById[u.enrollment_id]);
+  // Steps L&D removed for individual learners
+  const removed = new Set(d.exclusions.map((x) => `${x.enrollment_id}:${x.step_id}`));
+  const assigned = (s) => enrollments.filter((e) => e.program_id === s.program_id && !removed.has(`${e.id}:${s.id}`)).length;
+  const responses = d.responses.filter((r) => stepById[r.step_id]);
 
   // --- Learners (one row per enrolment) ---
   const learners = enrollments.map((e) => {
@@ -98,6 +130,7 @@ function compute(d) {
   const programRows = programs.map((p) => {
     const rows = learners.filter((l) => l.programId === p.id);
     const scores = rows.map((r) => r.avgScore).filter((v) => v != null);
+    const fb = feedbackOf(responses.filter((r) => stepById[r.step_id].program_id === p.id), d.scaleQs);
     return {
       id: p.id, title: p.title, type: PROGRAM_TYPE[p.program_type], status: p.status, owner: p.owner?.full_name ?? "",
       due: p.due_date, learners: rows.length,
@@ -105,12 +138,13 @@ function compute(d) {
       completed: rows.filter((r) => r.status === "Completed").length,
       overdue: rows.filter((r) => r.status === "Overdue").length,
       avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+      rating: fb.rating, nps: fb.nps,
     };
   });
 
   // --- Steps (module-wise) ---
   const stepRows = steps.map((s) => {
-    const enrolled = enrollments.filter((e) => e.program_id === s.program_id).length;
+    const enrolled = assigned(s);
     const prog = stepProgress.filter((p) => p.step_id === s.id);
     const done = prog.filter((p) => p.status === "completed");
     const scores = prog.filter((p) => p.score != null).map((p) => Number(p.score));
@@ -123,7 +157,26 @@ function compute(d) {
       avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
       passRate: tried.size ? Math.round((passed.size / tried.size) * 100) : null,
       pending: uploads.filter((u) => u.step_id === s.id && u.status === "pending").length,
+      feedback: s.step_type === "survey" ? feedbackOf(responses.filter((r) => r.step_id === s.id), d.scaleQs) : null,
     };
+  });
+
+  // --- Survey feedback (for the period) ---
+  const surveySteps = steps.filter((s) => s.step_type === "survey");
+  const responsesInPeriod = responses.filter((r) => inPeriod(r.submitted_at));
+  const fbPeriod = feedbackOf(responsesInPeriod, d.scaleQs);
+  const surveyAssigned = surveySteps.reduce((a, s) => a + assigned(s), 0);
+  const surveyDone = surveySteps.reduce((a, s) => a + stepProgress.filter((p) => p.step_id === s.id && p.status === "completed").length, 0);
+  const feedback = [
+    { label: "Average Rating", value: fmtRating(fbPeriod.rating), hint: "star questions in surveys" },
+    { label: "Recommendation Score", value: fmtNps(fbPeriod.nps), hint: "NPS, from −100 to +100" },
+    { label: "Agreement", value: fbPeriod.agree == null ? "–" : `${fbPeriod.agree}%`, hint: "answered Agree or Strongly Agree" },
+    { label: "Survey Responses", value: fbPeriod.responses, hint: surveyAssigned ? `${Math.round((surveyDone / surveyAssigned) * 100)}% of learners have answered` : "no surveys yet" },
+  ];
+  const surveyRows = surveySteps.map((s) => {
+    const fb = feedbackOf(responses.filter((r) => r.step_id === s.id), d.scaleQs);
+    const n = assigned(s);
+    return { program: programById[s.program_id].title, title: s.title, assigned: n, ...fb, rate: n ? Math.round((fb.responses / n) * 100) : 0 };
   });
 
   // --- Period activity ---
@@ -158,7 +211,7 @@ function compute(d) {
       uploaded: u.uploaded_at, reviewedBy: u.reviewer?.full_name ?? "", reviewed: u.reviewed_at, comment: u.review_comment ?? "" };
   });
 
-  return { kpis, trend, programRows, learners, stepRows, attemptRows, uploadRows, start };
+  return { kpis, feedback, surveyRows, trend, programRows, learners, stepRows, attemptRows, uploadRows, start };
 }
 
 // Count completions per day / week / month, depending on the period
@@ -284,6 +337,16 @@ function drawDashboard(box, v) {
         </div>`).join("")}
     </div>
 
+    <h2 class="section-title">Learner Feedback <span class="muted small" style="font-weight:500">${esc(PERIODS[filters.period])}, from surveys</span></h2>
+    <div class="kpi-grid feedback-grid">
+      ${v.feedback.map((k) => `
+        <div class="card kpi feedback">
+          <span class="label">${esc(k.label)}</span>
+          <b>${esc(k.value)}</b>
+          <span class="muted small">${esc(k.hint)}</span>
+        </div>`).join("")}
+    </div>
+
     <div class="chart-grid">
       <div class="card">
         <div class="card-head"><h2>Steps Completed</h2><span class="muted small">${esc(PERIODS[filters.period])}, by ${unitWord}</span></div>
@@ -324,11 +387,12 @@ function drawTable(el, v) {
   if (filters.view === "programs") {
     el.innerHTML = v.programRows.length ? `
       <div class="table-wrap"><table class="data clickable">
-        <thead><tr><th>Program</th><th>Type</th><th>Status</th><th>Learners</th><th>Avg. Completion</th><th>Completed</th><th>Overdue</th><th>Avg. Score</th><th>Due Date</th></tr></thead>
+        <thead><tr><th>Program</th><th>Type</th><th>Status</th><th>Learners</th><th>Avg. Completion</th><th>Completed</th><th>Overdue</th><th>Avg. Score</th><th>Avg. Rating</th><th>NPS</th><th>Due Date</th></tr></thead>
         <tbody>${v.programRows.map((p) => `
           <tr data-open="${p.id}"><td class="name"><strong>${esc(p.title)}</strong><span>${esc(p.owner)}</span></td>
             <td>${esc(p.type)}</td><td>${statusPill(p.status)}</td><td>${p.learners}</td><td>${meter(p.avgPct)}</td>
             <td>${p.completed}</td><td>${p.overdue ? `<span class="pill crit">${p.overdue}</span>` : 0}</td><td>${pct(p.avgScore)}</td>
+            <td>${p.rating == null ? '<span class="muted">–</span>' : `★ ${p.rating}`}</td><td>${p.nps == null ? '<span class="muted">–</span>' : fmtNps(p.nps)}</td>
             <td>${esc(fmtDate(p.due))}</td></tr>`).join("")}</tbody>
       </table></div>` : '<div class="empty"><div><strong>No Programs In View</strong>Change the filters above.</div></div>';
     el.querySelector("tbody")?.addEventListener("click", (e) => {
@@ -369,7 +433,8 @@ function drawTable(el, v) {
       <tbody>${v.stepRows.map((s) => `
         <tr><td>${esc(s.program)}</td><td class="name"><strong>${s.position}. ${esc(s.title)}</strong>${s.required ? "" : "<span>Optional</span>"}</td>
           <td>${esc(s.type)}</td><td>${s.completed} / ${s.enrolled}</td><td>${meter(s.rate)}</td>
-          <td>${pct(s.avgScore)}</td><td>${pct(s.passRate)}</td><td>${s.pending || ""}</td></tr>`).join("")}</tbody>
+          <td>${s.feedback ? (s.feedback.rating != null ? `★ ${s.feedback.rating} / 5` : s.feedback.nps != null ? `NPS ${fmtNps(s.feedback.nps)}` : '<span class="muted">–</span>') : pct(s.avgScore)}</td>
+          <td>${pct(s.passRate)}</td><td>${s.pending || ""}</td></tr>`).join("")}</tbody>
     </table></div>` : '<div class="empty"><div><strong>No Steps In View</strong>Add steps to a program’s learning journey.</div></div>';
 }
 
@@ -405,12 +470,21 @@ async function exportExcel(v, data, me) {
     [],
     ["Measure", "Value", "Detail"],
     ...v.kpis.map((k) => [k.label, k.value, k.hint]),
+    [],
+    ["Learner Feedback", "", ""],
+    ...v.feedback.map((k) => [k.label, k.value, k.hint]),
   ], [28, 22, 40, 24]);
 
   sheet("Programs", v.programRows.map((p) => ({
     Program: p.title, Type: p.type, Status: PROGRAM_STATUS[p.status].label, Owner: p.owner, "Due Date": xDate(p.due),
     Learners: p.learners, "Average Completion %": p.avgPct, Completed: p.completed, Overdue: p.overdue, "Average Score %": p.avgScore ?? "",
-  })), [34, 12, 12, 22, 12, 10, 20, 11, 9, 16]);
+    "Average Rating (1-5)": p.rating ?? "", NPS: p.nps ?? "",
+  })), [34, 12, 12, 22, 12, 10, 20, 11, 9, 16, 18, 8]);
+
+  sheet("Survey Feedback", v.surveyRows.length ? v.surveyRows.map((r) => ({
+    Program: r.program, Survey: r.title, "Learners Assigned": r.assigned, Responses: r.responses, "Response Rate %": r.rate,
+    "Average Rating (1-5)": r.rating ?? "", NPS: r.nps ?? "", "Agreement %": r.agree ?? "",
+  })) : [["No surveys yet."]], [32, 32, 16, 11, 15, 18, 8, 12]);
 
   sheet("Learners", v.learners.map((l) => ({
     Learner: l.name, Email: l.email, Program: l.program, "Completion %": l.pct, "Steps Done": l.done, "Steps Required": l.total,
@@ -499,7 +573,32 @@ async function exportPdf(v, data, me) {
     doc.setTextColor(...MUTED);
     doc.text(doc.splitTextToSize(k.hint, tileW - 18)[0], x + 12, ty + 54);
   });
-  y += tileH * 2 + gap + 28;
+  y += tileH * 2 + gap + 12;
+
+  // Learner feedback tiles
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(9);
+  doc.setTextColor(...MUTED);
+  doc.text(`LEARNER FEEDBACK  (${PERIODS[filters.period].toUpperCase()}, FROM SURVEYS)`, M, y + 8);
+  y += 14;
+  v.feedback.forEach((k, i) => {
+    const x = M + i * (tileW + gap);
+    doc.setFillColor(243, 248, 247);
+    doc.setDrawColor(...LINE);
+    doc.roundedRect(x, y, tileW, tileH - 8, 6, 6, "FD");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7.5);
+    doc.setTextColor(...MUTED);
+    doc.text(k.label, x + 12, y + 16);
+    doc.setFontSize(16);
+    doc.setTextColor(...INK);
+    doc.text(String(k.value).replace("−", "-"), x + 12, y + 36);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(...MUTED);
+    doc.text(doc.splitTextToSize(k.hint.replace("−", "-"), tileW - 18)[0], x + 12, y + 48);
+  });
+  y += tileH + 20;
 
   // Chart: steps completed over time
   const sectionTitle = (title, sub, at) => {
@@ -575,8 +674,8 @@ async function exportPdf(v, data, me) {
     });
   };
   const fmt = (n) => (n == null ? "–" : `${n}%`);
-  table("Programs", ["Program", "Type", "Status", "Learners", "Avg. Completion", "Completed", "Overdue", "Avg. Score"],
-    v.programRows.map((p) => [p.title, p.type, PROGRAM_STATUS[p.status].label, p.learners, `${p.avgPct}%`, p.completed, p.overdue, fmt(p.avgScore)]),
+  table("Programs", ["Program", "Type", "Status", "Learners", "Avg. Completion", "Completed", "Overdue", "Avg. Score", "Rating", "NPS"],
+    v.programRows.map((p) => [p.title, p.type, PROGRAM_STATUS[p.status].label, p.learners, `${p.avgPct}%`, p.completed, p.overdue, fmt(p.avgScore), p.rating == null ? "–" : `${p.rating}/5`, fmtNps(p.nps)]),
     { 0: { cellWidth: 150 } });
   table("Learners", ["Learner", "Program", "Progress", "Status", "Due Date", "Avg. Score", "Last Activity"],
     v.learners.map((l) => [`${l.name}\n${l.email}`, l.program, `${l.pct}% (${l.done}/${l.total})`, l.status, fmtDate(l.due), fmt(l.avgScore), fmtDate(l.lastActivity)]),

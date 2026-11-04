@@ -711,6 +711,12 @@ body.no-scroll { overflow: hidden; }
 .thanks-icon svg { width: 32px; height: 32px; }
 .thanks p { margin: 0 0 8px; }
 
+/* Dashboard feedback and per-learner steps */
+.feedback-grid .kpi.feedback::before { background: linear-gradient(180deg, #6db59e, #4fb3b8); }
+.feedback-grid .kpi.feedback b { color: var(--accent-ink); }
+.step-icon.mini { width: 28px; height: 28px; border-radius: 8px; flex: none; }
+.step-icon.mini svg { width: 15px; height: 15px; }
+
 /* ---------- Toasts ---------- */
 .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 60; display: grid; gap: 8px; }
 .toast {

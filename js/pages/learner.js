@@ -88,12 +88,14 @@ async function loadEnrollments(programId = null) {
   if (!programIds.length) return [];
 
   const none = Promise.resolve({ data: [] });
-  const [{ data: steps }, { data: progress }, { data: uploads }] = await Promise.all([
+  const [{ data: steps }, { data: progress }, { data: uploads }, { data: exclusions }] = await Promise.all([
     sb.from("program_steps").select("*").in("program_id", programIds).order("position"),
     enrollmentIds.length ? sb.from("step_progress").select("*").in("enrollment_id", enrollmentIds) : none,
     enrollmentIds.length
       ? sb.from("uploads").select("*").in("enrollment_id", enrollmentIds).order("uploaded_at", { ascending: false })
       : none,
+    // Steps L&D removed for this learner
+    enrollmentIds.length ? sb.from("enrollment_exclusions").select("enrollment_id, step_id").in("enrollment_id", enrollmentIds) : none,
   ]);
   const stepIds = (steps ?? []).map((s) => s.id);
   // Only links for steps that are open come back (the database hides the rest)
@@ -107,7 +109,8 @@ async function loadEnrollments(programId = null) {
   const formSteps = new Set((formQs ?? []).map((q) => q.step_id));
 
   return enrollments.map((e) => {
-    const mySteps = (steps ?? []).filter((s) => s.program_id === e.program_id);
+    const removed = new Set((exclusions ?? []).filter((x) => x.enrollment_id === e.id).map((x) => x.step_id));
+    const mySteps = (steps ?? []).filter((s) => s.program_id === e.program_id && !removed.has(s.id));
     const progressByStep = Object.fromEntries((progress ?? []).filter((p) => p.enrollment_id === e.id).map((p) => [p.step_id, p]));
     const uploadsByStep = {};
     for (const u of (uploads ?? []).filter((u) => u.enrollment_id === e.id)) (uploadsByStep[u.step_id] ??= []).push(u);

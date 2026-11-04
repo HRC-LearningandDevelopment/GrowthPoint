@@ -10,7 +10,7 @@ export async function renderFormResults(main, program, stepId, me) {
     sb.from("program_steps").select("*").eq("id", stepId).maybeSingle(),
     sb.from("assessment_questions").select("*, assessment_answer_keys(correct)").eq("step_id", stepId).order("position"),
     sb.from("form_sections").select("*").eq("step_id", stepId).order("position"),
-    sb.from("enrollments").select("id, learner:profiles(full_name, email)").eq("program_id", program.id),
+    sb.from("enrollments").select("id, learner:profiles(full_name, email), enrollment_exclusions(step_id)").eq("program_id", program.id),
   ]);
   if (!step) { location.hash = `#/programs/${program.id}/journey`; return; }
   const reload = () => renderFormResults(main, program, stepId, me);
@@ -25,7 +25,9 @@ export async function renderFormResults(main, program, stepId, me) {
       </div>
     </header>`;
   const sectionTitle = Object.fromEntries((sections ?? []).map((s) => [s.id, s.title]));
-  const ctx = { main, program, step, questions: questions ?? [], enrolled: (enrolled ?? []).sort((a, b) => a.learner.full_name.localeCompare(b.learner.full_name)), me, reload, header, sectionTitle };
+  const ctx = { main, program, step, questions: questions ?? [], enrolled: (enrolled ?? [])
+    .filter((e) => !(e.enrollment_exclusions ?? []).some((x) => x.step_id === stepId)) // only learners who have this step
+    .sort((a, b) => a.learner.full_name.localeCompare(b.learner.full_name)), me, reload, header, sectionTitle };
   return step.step_type === "assessment" ? assessmentResults(ctx) : surveyResults(ctx);
 }
 
