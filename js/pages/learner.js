@@ -282,70 +282,176 @@ async function programPage(main, ctx, programId) {
   const needVideo = p.welcome_video_path && !e.welcome_completed_at;
   const needReading = p.required_reading && !e.reading_ack_at;
   const objectives = (p.objectives ?? "").split(/\r?\n/).map((l) => l.replace(/^[-•*\d.)\s]+/, "").trim()).filter(Boolean);
+  const firstName = mode.name.split(" ")[0];
+  const greeting = e.pct === 100 ? `Well Done, ${esc(firstName)} <span class="wave">🎉</span>`
+    : e.pct > 0 ? `Welcome Back, ${esc(firstName)}` : `Welcome, ${esc(firstName)} <span class="wave">👋</span>`;
+  const eyebrow = e.pct === 100 ? "Program Complete" : e.pct > 0 ? "Keep Going" : "Your Program Starts Here";
+  const shortDate = (v) => new Date(`${v}T00:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const nextStep = e.steps.find((s) => ["open", "redo"].includes(s.state.key)) ?? e.steps.find((s) => s.state.key !== "done");
+  const nowIndex = e.steps.indexOf(nextStep);
+  const doneCount = e.steps.filter((s) => s.state.key === "done").length;
+  const letter = (p.welcome_message ?? "").split(/\n\s*\n|\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const points = (p.required_reading ?? "").split(/\r?\n/).map((l) => l.replace(/^[-•*\d.)\s]+/, "").trim()).filter(Boolean);
+  const cta = needVideo ? "Watch The Welcome Video" : needReading ? "Read Before You Begin"
+    : e.pct === 100 ? "Review Your Journey" : e.pct > 0 ? "Continue Your Journey" : "Start Your Journey";
 
-  main.innerHTML = `
-    <header class="topbar">
-      <div>
-        <a class="back-link" href="${mode.base}">${icons.back} My Learning</a>
-        <h1>${esc(p.title)}</h1>
-        <p>${esc(PROGRAM_TYPE[p.program_type])}${e.dueDate ? ` · Due ${esc(fmtDate(e.dueDate))}` : ""} ${info?.cls ? duePill(info) : ""}</p>
+  main.innerHTML = `<div data-root>
+    <a class="back-link page-back reveal" href="${mode.base}">${icons.back} My Learning</a>
+
+    ${p.status === "draft" ? '<div class="notice info" style="margin-top:10px">This program is a draft. Learners can\'t see it until it\'s scheduled or live.</div>' : ""}
+    ${p.status === "on_hold" ? '<div class="notice" style="margin-top:10px">This program is on hold. Steps are paused until the L&amp;D team resumes it.</div>' : ""}
+    ${p.status === "scheduled" ? `<div class="notice info" style="margin-top:10px">This program starts ${p.start_date ? esc(fmtDate(p.start_date)) : "soon"}. Steps open once it begins.</div>` : ""}
+
+    <section class="hero reveal" style="--i:1">
+      <div class="aurora"><span></span><span></span><span></span></div>
+      <div class="hero-grid ${p.welcome_video_path ? "" : "single"}">
+        <div>
+          <div class="hero-top">
+            <span class="eyebrow"><i></i> ${eyebrow}</span>
+            <div class="ring anim big" style="--p:${e.pct}"><span>${e.pct}%</span></div>
+          </div>
+          <h1>${greeting}</h1>
+          <div class="program-name">You're enrolled in <b>${esc(p.title)}</b></div>
+          <div class="chips">
+            ${p.start_date ? `<span class="chip">${icons.calendar} Starts ${esc(shortDate(p.start_date))}</span>` : ""}
+            ${e.dueDate ? `<span class="chip ${info?.cls ?? ""}">${icons.flag} ${info?.cls ? esc(info.text) : `Due ${esc(shortDate(e.dueDate))}`}</span>` : ""}
+            <span class="chip">${icons.route} ${e.steps.length} Step${e.steps.length === 1 ? "" : "s"} · ${esc(PROGRAM_TYPE[p.program_type])}</span>
+          </div>
+          <div class="hero-actions">
+            <button class="btn light" data-cta>${esc(cta)} →</button>
+            <button class="btn glass" data-message>${icons.messages} Message L&amp;D</button>
+          </div>
+        </div>
+        ${p.welcome_video_path ? `
+          <div data-video-area>
+            <div class="video-card">
+              <video data-welcome playsinline controls controlslist="nodownload noplaybackrate" disablepictureinpicture preload="metadata"></video>
+            </div>
+            ${needVideo ? `
+              <div class="video-meter"><i data-watch-bar></i></div>
+              <div class="video-hint" data-watch-text>Watch the full video to unlock your learning journey.</div>`
+              : '<div class="video-hint done">✓ Welcome video watched. Replay it any time.</div>'}
+          </div>` : ""}
       </div>
-      <div class="top-actions">
-        <button class="btn" data-message>${icons.messages} Message L&amp;D</button>
-        <div class="ring big" style="--p:${e.pct}"><span>${e.pct}%</span></div>
-      </div>
-    </header>
+      ${letter.length ? `
+        <div class="letter">
+          ${letter.map((l) => `<p>${esc(l)}</p>`).join("")}
+          <div class="sign"><span class="mark">${icons.brand}</span> The L&amp;D Team</div>
+        </div>` : ""}
+    </section>
 
-    ${p.status === "draft" ? '<div class="notice info" style="margin-bottom:16px">This program is a draft. Learners can\'t see it until it\'s scheduled or live.</div>' : ""}
-    ${p.status === "on_hold" ? '<div class="notice" style="margin-bottom:16px">This program is on hold. Steps are paused until the L&amp;D team resumes it.</div>' : ""}
-    ${p.status === "scheduled" ? `<div class="notice info" style="margin-bottom:16px">This program starts ${p.start_date ? esc(fmtDate(p.start_date)) : "soon"}. Steps open once it begins.</div>` : ""}
+    ${e.steps.length ? `
+      <section class="card glance reveal" style="--i:2">
+        <div class="card-head"><h2>Your Journey At A Glance</h2><span class="muted small">${doneCount} of ${e.steps.length} step${e.steps.length === 1 ? "" : "s"} done</span></div>
+        <div class="track" style="--n:${e.steps.length}; --fill:${e.steps.length > 1 ? (Math.max(0, nowIndex === -1 ? e.steps.length - 1 : nowIndex) / (e.steps.length - 1)) * (100 - 100 / e.steps.length) : 0}%">
+          <div class="fill"></div>
+          ${e.steps.map((s, i) => `
+            <button type="button" class="milestone ${s.state.key === "done" ? "done" : i === nowIndex ? "now" : ""}" data-goto="${s.id}">
+              <span class="dot">${s.state.key === "done" ? icons.check : stepIcon(s.step_type)}</span>
+              <span>${esc(s.title)}</span>
+              <small>${s.state.key === "done" ? "Done" : i === nowIndex ? "You Are Here" : s.state.key === "locked" ? "Locked" : "Ready"}</small>
+            </button>`).join("")}
+        </div>
+      </section>` : ""}
 
-    <div class="stack">
-      ${p.welcome_message || p.welcome_video_path ? `
-        <section class="card welcome ${needVideo ? "gate" : ""}">
-          <div class="card-head"><h2>Welcome</h2>${p.welcome_video_path && !needVideo ? '<span class="pill good">Video Watched</span>' : ""}</div>
-          ${p.welcome_message ? `<div class="prose-text">${esc(p.welcome_message)}</div>` : ""}
-          ${p.welcome_video_path ? `
-            ${needVideo ? '<p class="gate-note">Please watch the full welcome video. The rest of the program opens when it ends.</p>' : ""}
-            <video class="video-box" data-welcome playsinline controls controlslist="nodownload noplaybackrate" disablepictureinpicture preload="metadata"></video>
-            ${needVideo ? '<div class="watch-bar"><i data-watch-bar></i></div><p class="muted" data-watch-text></p>' : ""}` : ""}
-        </section>` : ""}
+    ${p.overview || objectives.length ? `
+      <section class="card reveal" style="--i:3; margin-top:16px">
+        <div class="card-head"><h2>About This Program</h2></div>
+        ${p.overview ? `<div class="prose-text">${esc(p.overview)}</div>` : ""}
+        ${objectives.length ? `<h3 class="sub-title">What You'll Be Able To Do</h3><ul class="objectives">${objectives.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>` : ""}
+      </section>` : ""}
 
-      ${p.overview || objectives.length ? `
-        <section class="card">
-          <div class="card-head"><h2>About This Program</h2></div>
-          ${p.overview ? `<div class="prose-text">${esc(p.overview)}</div>` : ""}
-          ${objectives.length ? `<h3 class="sub-title">What You'll Be Able To Do</h3><ul class="objectives">${objectives.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>` : ""}
-        </section>` : ""}
+    ${p.required_reading ? `
+      <section class="card begin reveal ${needReading && !needVideo ? "gate" : ""}" style="--i:4; margin-top:16px" data-begin>
+        <div class="confetti" data-confetti></div>
+        <div class="head">
+          <div class="badge">${icons.review}</div>
+          <div><h2>Before You Begin</h2><div class="muted small">A few things to know so your progress counts.</div></div>
+        </div>
+        ${points.length > 1 ? `<ol class="points">${points.map((t) => `<li>${esc(t)}</li>`).join("")}</ol>` : `<div class="prose-text">${esc(p.required_reading)}</div>`}
+        <div class="ack-row">
+          ${e.reading_ack_at
+            ? `<button class="btn ack done" disabled>${icons.check.replace("<svg", '<svg class="tick"')}<span>Read And Understood</span></button>`
+            : `<button class="btn primary ack" data-ack ${needVideo ? "disabled" : ""}>${icons.check.replace("<svg", '<svg class="tick"')}<span>I Have Read And Understood This</span></button>`}
+          <button class="link-remark" data-remark="reading">${icons.messages} Questions About This? Leave A Remark</button>
+        </div>
+        ${needVideo ? '<p class="muted small" style="margin:10px 0 0">Watch the welcome video first.</p>' : ""}
+        <div class="remark flat" data-panel="reading"><div><div class="remark-box"></div></div></div>
+      </section>` : ""}
 
-      ${p.required_reading ? `
-        <section class="card reading ${needReading ? "gate" : ""}">
-          <div class="card-head"><h2>Required Reading</h2>${e.reading_ack_at ? '<span class="pill good">Read</span>' : ""}</div>
-          <div class="prose-text">${esc(p.required_reading)}</div>
-          ${needReading ? `<button class="btn primary" data-ack ${needVideo ? "disabled" : ""}>I Have Read And Understood This</button>
-            ${needVideo ? '<p class="muted">Watch the welcome video first.</p>' : ""}` : ""}
-        </section>` : ""}
-
-      <section>
-        <h2 class="section-title">Learning Journey</h2>
-        ${e.steps.length ? `<ol class="steps learner">${e.steps.map((s, i) => learnerStep(s, i, e)).join("")}</ol>`
-          : '<div class="empty"><div>The L&amp;D team hasn\'t added any steps yet.</div></div>'}
-      </section>
-    </div>`;
+    <section class="reveal" style="--i:5" data-journey>
+      <h2 class="section-title" style="margin-top:22px">Learning Journey</h2>
+      ${e.steps.length ? `<ol class="steps learner">${e.steps.map((s, i) => learnerStep(s, i, e)).join("")}</ol>`
+        : '<div class="empty"><div>The L&amp;D team hasn\'t added any steps yet.</div></div>'}
+    </section>
+  </div>`;
+  const root = main.querySelector("[data-root]");
 
   // Welcome video (no skipping ahead; progress is saved)
   const video = main.querySelector("[data-welcome]");
   if (video) setUpVideo(video, e, needVideo && !mode.preview, reload);
 
+  const scrollTo = (el) => el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  main.querySelector("[data-cta]").addEventListener("click", () => {
+    if (needVideo && video) { scrollTo(video); video.play().catch(() => {}); return; }
+    if (needReading) return scrollTo(main.querySelector("[data-begin]"));
+    scrollTo(nextStep ? main.querySelector(`[data-step-card="${nextStep.id}"]`) : main.querySelector("[data-journey]"));
+  });
+  main.querySelectorAll("[data-goto]").forEach((b) => b.addEventListener("click", () => scrollTo(main.querySelector(`[data-step-card="${b.dataset.goto}"]`))));
   main.querySelector("[data-message]").addEventListener("click", () => (mode.preview ? previewOnly() : newMessage(ctx.me, p.id)));
 
   main.querySelector("[data-ack]")?.addEventListener("click", async (ev) => {
     if (mode.preview) return previewOnly();
-    ev.target.disabled = true;
+    const btn = ev.currentTarget;
+    btn.disabled = true;
     const { error } = await sb.rpc("acknowledge_reading", { p_program: p.id });
-    if (error) { toast(error.message, "err"); ev.target.disabled = false; return; }
+    if (error) { toast(error.message, "err"); btn.disabled = false; return; }
+    btn.classList.add("done");
+    btn.classList.remove("primary");
+    btn.querySelector("span").textContent = "Read And Understood";
+    celebrate(main.querySelector("[data-confetti]"));
     toast("Thanks! Your learning journey is open.");
-    reload();
+    setTimeout(reload, 1300);
+  });
+
+  // "Leave A Remark" on the reading and on every step → the L&D Messages inbox
+  root.addEventListener("click", async (ev) => {
+    const open = ev.target.closest("[data-remark]");
+    const cancel = ev.target.closest("[data-remark-cancel]");
+    const send = ev.target.closest("[data-remark-send]");
+    if (open) {
+      const key = open.dataset.remark;
+      const panel = main.querySelector(`[data-panel="${key}"]`);
+      const about = key === "reading" ? "Before You Begin" : e.steps.find((s) => s.id === key)?.title ?? "";
+      const box = panel.querySelector(".remark-box");
+      if (!panel.classList.contains("open")) {
+        box.innerHTML = `
+          <p>Your remark about <b>${esc(about)}</b> goes straight to the L&amp;D team's inbox. You'll see their reply in Messages.</p>
+          <textarea class="input prose short" placeholder="Share a question, feedback or a problem…"></textarea>
+          <div class="row"><button type="button" class="btn" data-remark-cancel>Cancel</button><button type="button" class="btn primary" data-remark-send="${esc(key)}">Send To L&amp;D</button></div>`;
+        setTimeout(() => box.querySelector("textarea")?.focus(), 300);
+      }
+      panel.classList.toggle("open");
+    }
+    if (cancel) cancel.closest(".remark").classList.remove("open");
+    if (send) {
+      if (mode.preview) return previewOnly();
+      const box = send.closest(".remark-box");
+      const text = box.querySelector("textarea").value.trim();
+      if (!text) return toast("Write your remark first.", "err");
+      const key = send.dataset.remarkSend;
+      const about = key === "reading" ? "Before You Begin" : e.steps.find((s) => s.id === key)?.title ?? "";
+      send.disabled = true;
+      try {
+        await sendRemark(ctx.me, p.id, about, text);
+        box.innerHTML = `<div class="remark-sent">${icons.check} Sent to the L&amp;D team. You'll see their reply in Messages.</div>`;
+        toast("Remark sent to the L&D team.");
+        setTimeout(() => box.closest(".remark")?.classList.remove("open"), 2600);
+      } catch (err) {
+        toast(err.message, "err");
+        send.disabled = false;
+      }
+    }
   });
 
   main.querySelector(".steps")?.addEventListener("click", (ev) => {
@@ -359,6 +465,23 @@ async function programPage(main, ctx, programId) {
     if (btn.dataset.act === "view-file") viewFile(btn.dataset.path);
     if (btn.dataset.act === "join") sb.rpc("start_step", { p_step: step.id }).then(() => {});
   });
+}
+
+// A remark becomes a conversation in the L&D Messages inbox
+async function sendRemark(me, programId, about, text) {
+  const { data: thread, error } = await sb.from("message_threads")
+    .insert({ learner_id: me.id, program_id: programId, subject: `Remark: ${about}`.slice(0, 120) })
+    .select("id").single();
+  if (error) throw error;
+  const { error: msgErr } = await sb.from("thread_messages").insert({ thread_id: thread.id, body: text });
+  if (msgErr) throw msgErr;
+}
+
+// A small burst of colour when the learner confirms the reading
+function celebrate(box) {
+  if (!box || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const colors = ["#4fb3b8", "#2a7fc0", "#6db59e", "#e6a532"];
+  box.innerHTML = Array.from({ length: 22 }, (_, i) => `<i style="left:${14 + Math.random() * 22}%;background:${colors[i % 4]};--x:${Math.round(Math.random() * 260 - 60)}px;--y:${Math.round(-60 - Math.random() * 120)}px;--r:${Math.round(Math.random() * 540)}deg;animation-delay:${(Math.random() * 0.15).toFixed(2)}s"></i>`).join("");
 }
 
 function learnerStep(s, i, e) {
@@ -396,11 +519,12 @@ function learnerStep(s, i, e) {
   const latest = ups[0];
 
   return `
-    <li class="step ${st.key}">
+    <li class="step-wrap" data-step-card="${s.id}">
+    <div class="step ${st.key}">
       <div class="step-num"><span>${st.key === "done" ? "✓" : i + 1}</span></div>
       <div class="step-icon">${st.key === "locked" ? icons.lock : stepIcon(s.step_type)}</div>
       <div class="step-body">
-        <div class="step-type">${esc(STEP_TYPE[s.step_type].short)}${s.is_required ? "" : " · optional"}</div>
+        <div class="step-type">${esc(STEP_TYPE[s.step_type].short)}${s.is_required ? "" : " · Optional"}</div>
         <strong>${esc(s.title)}</strong>
         ${sessionLine}
         ${s.description && st.key !== "locked" ? `<div class="step-desc">${esc(s.description)}</div>` : ""}
@@ -414,7 +538,12 @@ function learnerStep(s, i, e) {
             ${latest.status === "rejected" && latest.review_comment ? `<div class="notice">L&amp;D: ${esc(latest.review_comment)}</div>` : ""}
           </div>` : ""}
       </div>
-      <div class="step-actions">${action}</div>
+      <div class="step-actions stacked">
+        ${action}
+        <button type="button" class="remark-btn" data-remark="${s.id}">${icons.messages} Leave A Remark</button>
+      </div>
+    </div>
+    <div class="remark" data-panel="${s.id}"><div><div class="remark-box"></div></div></div>
     </li>`;
 }
 
@@ -422,8 +551,9 @@ function setUpVideo(video, e, gated, reload) {
   let maxWatched = Number(e.welcome_watched_seconds) || 0;
   let lastSaved = maxWatched;
   let finished = !gated;
-  const bar = video.parentElement.querySelector("[data-watch-bar]");
-  const text = video.parentElement.querySelector("[data-watch-text]");
+  const area = video.closest("[data-video-area]") ?? video.parentElement;
+  const bar = area.querySelector("[data-watch-bar]");
+  const text = area.querySelector("[data-watch-text]");
 
   sb.storage.from(VIDEO_BUCKET).createSignedUrl(e.program.welcome_video_path, 4 * 3600).then(({ data }) => {
     if (data?.signedUrl) video.src = data.signedUrl;
