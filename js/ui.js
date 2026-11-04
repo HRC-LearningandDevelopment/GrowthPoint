@@ -138,6 +138,20 @@ export const STEP_TYPE = {
   upload:      { label: "Upload (Certificate / Workbook)", short: "Upload" },
 };
 
+// Question types for the assessment and survey builder
+export const QTYPE = {
+  single:    { label: "Single Choice",            forms: ["assessment", "survey"], choices: true },
+  multi:     { label: "Multiple Choice (Several Answers)", forms: ["assessment", "survey"], choices: true },
+  truefalse: { label: "True / False",             forms: ["assessment"] },
+  short:     { label: "Short Answer",             forms: ["assessment"] },
+  rating:    { label: "Rating (1 To 5 Stars)",    forms: ["survey"] },
+  likert:    { label: "Agree / Disagree Scale",   forms: ["survey"] },
+  nps:       { label: "0 To 10 Scale",            forms: ["survey"] },
+  text:      { label: "Short Text",               forms: ["survey"] },
+  paragraph: { label: "Long Text",                forms: ["survey"] },
+};
+export const LIKERT = ["Strongly Disagree", "Disagree", "Neutral", "Agree", "Strongly Agree"];
+
 export const statusPill = (status) =>
   `<span class="pill ${PROGRAM_STATUS[status]?.pill ?? ""}">${esc(PROGRAM_STATUS[status]?.label ?? status)}</span>`;
 
@@ -187,6 +201,9 @@ export const icons = {
   calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>',
   flag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></svg>',
   route: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M8.5 18H15a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h6.5"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  star: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/></svg>',
   eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
   // Learning-journey step types

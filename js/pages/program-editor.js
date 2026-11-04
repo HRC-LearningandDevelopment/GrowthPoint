@@ -4,6 +4,8 @@ import {
   esc, toast, openModal, icons, stepIcon, statusPill, fmtDate, fmtDateTime, toLocalInput, fromLocalInput,
   PROGRAM_TYPE, PROGRAM_STATUS, STEP_TYPE, LIBS, loadScript, downloadBlob, safeName,
 } from "../ui.js";
+import { renderFormBuilder } from "./form-builder.js";
+import { renderFormResults } from "./form-results.js";
 
 const VIDEO_BUCKET = "welcome-videos";
 const UPLOAD_BUCKET = "learner-uploads";
@@ -36,7 +38,7 @@ const STATUS_EFFECT = {
 const LINK_HINT = {
   module: "The module's address on the L&D GitHub, e.g. https://….github.io/module-1/",
   ilt_session: "The Microsoft Teams meeting link.",
-  survey: "The survey link, e.g. Microsoft Forms.",
+  survey: "Optional: an external survey link (e.g. Microsoft Forms). Leave empty to build the survey here with Build.",
 };
 
 export async function renderProgramEditor(main, ctx) {
@@ -52,6 +54,10 @@ export async function renderProgramEditor(main, ctx) {
       <div class="empty"><div>It may have been deleted.</div></div>`;
     return;
   }
+
+  // Assessment / survey builder and results have their own pages
+  if (tabParam === "form") return renderFormBuilder(main, program, ctx.params[2]);
+  if (tabParam === "results") return renderFormResults(main, program, ctx.params[2], ctx.me);
 
   const canDelete = program.status === "draft" || ctx.me.role === "admin";
   main.innerHTML = `
@@ -156,23 +162,38 @@ function duplicateProgram(program, me) {
       }
 
       const { data: steps } = await sb.from("program_steps")
-        .select("*, step_links(url), assessment_questions(*, assessment_answer_keys(correct_option))")
+        .select("*, step_links(url), form_sections(*), assessment_questions(*, assessment_answer_keys(correct, correct_option))")
         .eq("program_id", program.id).order("position");
       for (const s of steps ?? []) {
         const { data: newStep, error: stepErr } = await sb.from("program_steps").insert({
           program_id: copy.id, position: s.position, step_type: s.step_type, title: s.title, description: s.description,
           is_required: s.is_required, passing_score: s.passing_score, completion_text: s.completion_text,
+          time_limit_minutes: s.time_limit_minutes, max_attempts: s.max_attempts, shuffle_questions: s.shuffle_questions,
+          shuffle_options: s.shuffle_options, show_answers: s.show_answers, identity_mode: s.identity_mode, thank_you: s.thank_you,
         }).select("id").single();
         if (stepErr) throw stepErr;
         const url = linkOf(s);
         if (url) await sb.from("step_links").insert({ step_id: newStep.id, url });
-        for (const q of s.assessment_questions ?? []) {
-          const { data: newQ } = await sb.from("assessment_questions")
-            .insert({ step_id: newStep.id, position: q.position, question: q.question, options: q.options, points: q.points })
-            .select("id").single();
-          const key = keyOf(q);
-          if (newQ && key !== null) await sb.from("assessment_answer_keys").insert({ question_id: newQ.id, correct_option: key });
-        }
+
+        // Sections, questions and answer keys, with fresh ids
+        const sectionIds = {};
+        const sectionRows = (s.form_sections ?? []).map((sec) => {
+          sectionIds[sec.id] = crypto.randomUUID();
+          return { id: sectionIds[sec.id], step_id: newStep.id, position: sec.position, title: sec.title, description: sec.description };
+        });
+        if (sectionRows.length) await sb.from("form_sections").insert(sectionRows);
+        const keyRows = [];
+        const questionRows = (s.assessment_questions ?? []).map((q) => {
+          const id = crypto.randomUUID();
+          const k = Array.isArray(q.assessment_answer_keys) ? q.assessment_answer_keys[0] : q.assessment_answer_keys;
+          if (k) keyRows.push({ question_id: id, correct: k.correct, correct_option: k.correct_option });
+          return {
+            id, step_id: newStep.id, section_id: sectionIds[q.section_id] ?? null, position: q.position, qtype: q.qtype,
+            question: q.question, description: q.description, options: q.options, points: q.points, required: q.required,
+          };
+        });
+        if (questionRows.length) await sb.from("assessment_questions").insert(questionRows);
+        if (keyRows.length) await sb.from("assessment_answer_keys").insert(keyRows);
       }
       toast("Program duplicated. Set its dates before going live.");
       location.hash = `#/programs/${copy.id}/details`;
@@ -349,6 +370,19 @@ async function closeAndArchive(program, reload) {
       File: u.file_name, Status: { approved: "Approved", pending: "Waiting For Review", rejected: "Returned" }[u.status],
       Uploaded: d(u.uploaded_at), "Reviewed By": u.reviewer?.full_name ?? "", Reviewed: d(u.reviewed_at), Comment: u.review_comment ?? "",
     })) : [["No uploads."]], [26, 32, 30, 30, 18, 18, 20, 18, 40]);
+    const surveySteps = steps.filter((x) => x.step_type === "survey").map((x) => x.id);
+    const { data: responses } = surveySteps.length
+      ? await sb.from("survey_responses").select("step_id, respondent_id, answers, submitted_at").in("step_id", surveySteps)
+      : { data: [] };
+    const { data: surveyQs } = surveySteps.length
+      ? await sb.from("assessment_questions").select("id, step_id, question, qtype, options").in("step_id", surveySteps).order("position")
+      : { data: [] };
+    const nameOf = Object.fromEntries(enrolled.map((e) => [e.learner_id, e.learner.full_name]));
+    const qText = (q, v) => (v == null ? "" : q.qtype === "single" ? q.options[v] ?? v : q.qtype === "multi" ? [].concat(v).map((i) => q.options[i] ?? i).join("; ") : q.qtype === "likert" ? ["Strongly Disagree", "Disagree", "Neutral", "Agree", "Strongly Agree"][v] ?? v : v);
+    add("Survey Responses", (responses ?? []).length ? responses.flatMap((r) => (surveyQs ?? []).filter((q) => q.step_id === r.step_id).map((q) => ({
+      Survey: stepById[r.step_id]?.title ?? "", Submitted: d(r.submitted_at), Respondent: r.respondent_id ? nameOf[r.respondent_id] ?? "Learner" : "Anonymous",
+      Question: q.question, Answer: qText(q, r.answers?.[q.id]),
+    }))) : [["No survey responses."]], [26, 18, 24, 50, 50]);
     add("Messages", (threads ?? []).length ? threads.flatMap((t) => [...t.thread_messages]
       .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
       .map((m) => ({ Conversation: t.subject, Learner: t.learner?.full_name ?? "", Status: t.status === "open" ? "Open" : "Resolved",
@@ -367,10 +401,6 @@ const sameSite = (url) => { try { return new URL(url).origin === location.origin
 
 // Embedded one-to-one rows come back as an object or a one-item list
 const linkOf = (step) => (Array.isArray(step.step_links) ? step.step_links[0]?.url : step.step_links?.url) ?? "";
-const keyOf = (q) => {
-  const k = Array.isArray(q.assessment_answer_keys) ? q.assessment_answer_keys[0] : q.assessment_answer_keys;
-  return k?.correct_option ?? null;
-};
 
 // =====================================================================
 // Details
@@ -556,7 +586,8 @@ async function journeyTab(area, program, reload) {
     const i = Number(btn.dataset.i);
     const step = steps[i];
     if (btn.dataset.act === "edit") editStep(program, step, steps, reload);
-    if (btn.dataset.act === "questions") editQuestions(step, reload);
+    if (btn.dataset.act === "form") location.hash = `#/programs/${program.id}/form/${step.id}`;
+    if (btn.dataset.act === "results") location.hash = `#/programs/${program.id}/results/${step.id}`;
     if (btn.dataset.act === "attendance") markAttendance(program, step, reload);
     if (btn.dataset.act === "delete") deleteStep(step, reload);
     if (btn.dataset.act === "up" || btn.dataset.act === "down") {
@@ -573,20 +604,25 @@ async function journeyTab(area, program, reload) {
 
 function stepCard(s, i, total) {
   const url = linkOf(s);
-  const needsLink = ["module", "ilt_session", "survey"].includes(s.step_type);
   const qCount = s.assessment_questions?.[0]?.count ?? 0;
+  // A survey is either built here (questions) or an external link
+  const needsLink = ["module", "ilt_session"].includes(s.step_type) || (s.step_type === "survey" && !qCount);
   const meta = [
     s.step_type === "ilt_session" && s.session_start &&
       `Session ${esc(fmtDateTime(s.session_start))}${s.session_end ? ` – ${esc(new Date(s.session_end).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }))}` : ""}`,
     `Available ${s.unlock_at ? `from ${esc(fmtDateTime(s.unlock_at))}` : "when the program goes live"}`,
+    s.close_at && `Closes ${esc(fmtDateTime(s.close_at))}`,
     s.due_at && `Due ${esc(fmtDateTime(s.due_at))}`,
   ].filter(Boolean);
   const flags = [
-    needsLink && !url && '<span class="pill crit">Link Missing</span>',
+    needsLink && !url && (s.step_type === "survey" ? '<span class="pill crit">Not Set Up: Build It Or Add A Link</span>' : '<span class="pill crit">Link Missing</span>'),
+    s.step_type === "survey" && qCount && `<span class="pill">${qCount} Question${qCount === 1 ? "" : "s"}</span>`,
     s.step_type === "module" && url && !s.completion_text && '<span class="pill warn">Add Final Screen Words</span>',
     s.step_type === "module" && url && s.completion_text && !sameSite(url) && '<span class="pill crit">Different Website: Can\'t Track</span>',
     s.step_type === "assessment" && (qCount ? `<span class="pill">${qCount} Question${qCount === 1 ? "" : "s"}</span>` : '<span class="pill crit">No Questions</span>'),
     s.step_type === "assessment" && s.passing_score != null && `<span class="pill">Pass Mark ${Number(s.passing_score)}%</span>`,
+    s.step_type === "assessment" && s.time_limit_minutes && `<span class="pill">${icons.clock} ${s.time_limit_minutes} Min</span>`,
+    s.step_type === "assessment" && s.max_attempts && `<span class="pill">${s.max_attempts} Attempt${s.max_attempts === 1 ? "" : "s"}</span>`,
     s.step_type === "upload" && '<span class="pill teal">Checked By L&amp;D</span>',
     !s.is_required && '<span class="pill">Optional</span>',
   ].filter(Boolean);
@@ -602,7 +638,9 @@ function stepCard(s, i, total) {
         ${flags.length ? `<div class="step-flags">${flags.join("")}</div>` : ""}
       </div>
       <div class="step-actions">
-        ${s.step_type === "assessment" ? `<button class="btn sm" data-act="questions" data-i="${i}">Questions</button>` : ""}
+        ${["assessment", "survey"].includes(s.step_type) ? `
+          <button class="btn sm primary" data-act="form" data-i="${i}">Build</button>
+          <button class="btn sm" data-act="results" data-i="${i}">${s.step_type === "assessment" ? "Results" : "Responses"}</button>` : ""}
         ${s.step_type === "ilt_session" ? `<button class="btn sm" data-act="attendance" data-i="${i}">Attendance</button>` : ""}
         <button class="btn sm" data-act="edit" data-i="${i}">Edit</button>
         <button class="btn sm ghost icon" data-act="up" data-i="${i}" ${i === 0 ? "disabled" : ""} aria-label="Move up">${icons.up}</button>
@@ -650,9 +688,7 @@ function editStep(program, step, steps, reload) {
           <input class="input" type="datetime-local" name="due_at" value="${toLocalInput(s.due_at)}">
         </label>
       </div>
-      <label class="field" data-for="assessment">Passing Score (%) <span class="hint">(Optional)</span>
-        <input class="input" type="number" name="passing_score" min="0" max="100" step="1" value="${s.passing_score ?? ""}" style="max-width:140px">
-      </label>
+      <div class="notice info" data-for="assessment survey">After saving, click <b>Build</b> on this step to add sections, questions, the timer and other settings.</div>
       <label class="check"><input type="checkbox" name="is_required" ${s.is_required ? "checked" : ""}> Counts Toward Completion</label>`,
     submitLabel: step ? "Save Step" : "Add Step",
     onSubmit: async (f) => {
@@ -672,7 +708,6 @@ function editStep(program, step, steps, reload) {
         day.setHours(0, 0, 0, 0);
         unlockAt = day.toISOString();
       }
-      const score = f.passing_score.value === "" ? null : Number(f.passing_score.value);
 
       const row = {
         step_type: type,
@@ -682,7 +717,6 @@ function editStep(program, step, steps, reload) {
         session_end: sessionEnd,
         unlock_at: unlockAt,
         due_at: fromLocalInput(f.due_at.value),
-        passing_score: type === "assessment" ? score : null,
         completion_text: type === "module" ? f.completion_text.value.trim() || null : null,
         is_required: f.is_required.checked,
       };
@@ -707,7 +741,8 @@ function editStep(program, step, steps, reload) {
       }
       toast(step ? "Step saved." : "Step added.");
       reload();
-      if (!step && type === "assessment") toast("Next, click Questions on the new step to write the assessment.");
+      // New assessments and surveys go straight to the builder
+      if (!step && (type === "assessment" || (type === "survey" && !url))) location.hash = `#/programs/${program.id}/form/${stepId}`;
     },
   });
 
@@ -794,124 +829,6 @@ function deleteStep(step, reload) {
       reload();
     },
   });
-}
-
-// ---------------------------------------------------------------------
-// Assessment questions (multiple choice; answers are kept server-side)
-// ---------------------------------------------------------------------
-async function editQuestions(step, reload) {
-  const { data: existing, error } = await sb.from("assessment_questions")
-    .select("*, assessment_answer_keys(correct_option)").eq("step_id", step.id).order("position");
-  if (error) return toast(error.message, "err");
-
-  let questions = existing.map((q) => ({ id: q.id, question: q.question, options: [...q.options], correct: keyOf(q), points: Number(q.points) }));
-  if (!questions.length) questions = [blankQuestion()];
-
-  const { form } = openModal({
-    title: `Questions: ${step.title}`,
-    intro: "Multiple choice. Pick the correct answer for each question. Learners never see the answers; scores are worked out on the server.",
-    wide: true,
-    body: '<div data-qs class="questions"></div><button type="button" class="btn" data-add-q>' + icons.plus + " Add Question</button>",
-    submitLabel: "Save Questions",
-    onSubmit: async () => {
-      collect();
-      questions.forEach((q, i) => {
-        if (!q.question.trim()) throw new Error(`Question ${i + 1} has no text.`);
-        if (q.options.filter((o) => o.trim()).length < 2) throw new Error(`Question ${i + 1} needs at least two answer choices.`);
-        if (q.correct === null || !q.options[q.correct]?.trim()) throw new Error(`Pick the correct answer for question ${i + 1}.`);
-      });
-
-      const keepIds = new Set(questions.filter((q) => q.id).map((q) => q.id));
-      const removed = existing.filter((q) => !keepIds.has(q.id)).map((q) => q.id);
-      if (removed.length) {
-        const { error: delErr } = await sb.from("assessment_questions").delete().in("id", removed);
-        if (delErr) throw delErr;
-      }
-      for (const [i, q] of questions.entries()) {
-        // Drop blank choices, keeping the correct answer pointing at the same text
-        const correctText = q.options[q.correct];
-        const options = q.options.map((o) => o.trim()).filter(Boolean);
-        const correct = options.indexOf(correctText.trim());
-        const row = { step_id: step.id, position: i + 1, question: q.question.trim(), options, points: q.points || 1 };
-        let qid = q.id;
-        if (qid) {
-          const { error: upErr } = await sb.from("assessment_questions").update(row).eq("id", qid);
-          if (upErr) throw upErr;
-        } else {
-          const { data, error: insErr } = await sb.from("assessment_questions").insert(row).select("id").single();
-          if (insErr) throw insErr;
-          qid = data.id;
-        }
-        const { error: keyErr } = await sb.from("assessment_answer_keys").upsert({ question_id: qid, correct_option: correct });
-        if (keyErr) throw keyErr;
-      }
-      toast("Questions saved.");
-      reload();
-    },
-  });
-
-  const box = form.querySelector("[data-qs]");
-
-  function blankQuestion() {
-    return { id: null, question: "", options: ["", "", "", ""], correct: null, points: 1 };
-  }
-
-  // Read what's typed back into `questions` before re-drawing
-  function collect() {
-    box.querySelectorAll(".q").forEach((el, i) => {
-      const q = questions[i];
-      q.question = el.querySelector("[data-q]").value;
-      q.points = Number(el.querySelector("[data-points]").value) || 1;
-      q.options = [...el.querySelectorAll("[data-opt]")].map((o) => o.value);
-      const checked = el.querySelector("input[type=radio]:checked");
-      q.correct = checked ? Number(checked.value) : null;
-    });
-  }
-
-  function draw() {
-    box.innerHTML = questions.map((q, i) => `
-      <div class="q">
-        <div class="q-head">
-          <strong>Question ${i + 1}</strong>
-          <label class="q-points">Points <input class="input" type="number" min="1" step="1" value="${q.points}" data-points></label>
-          <button type="button" class="btn sm ghost icon danger" data-del-q="${i}" aria-label="Remove question" ${questions.length === 1 ? "disabled" : ""}>${icons.trash}</button>
-        </div>
-        <textarea class="input prose short" data-q placeholder="Type the question">${esc(q.question)}</textarea>
-        <div class="q-options">
-          ${q.options.map((o, j) => `
-            <div class="q-option">
-              <input type="radio" name="correct-${i}" value="${j}" ${q.correct === j ? "checked" : ""} aria-label="Correct answer">
-              <input class="input" data-opt value="${esc(o)}" placeholder="Answer choice ${j + 1}">
-              <button type="button" class="btn sm ghost icon" data-del-opt="${i}:${j}" aria-label="Remove choice" ${q.options.length <= 2 ? "disabled" : ""}>×</button>
-            </div>`).join("")}
-        </div>
-        <button type="button" class="link-btn dark" data-add-opt="${i}">+ Add Answer Choice</button>
-        <span class="hint">Select the circle next to the correct answer.</span>
-      </div>`).join("");
-  }
-
-  box.addEventListener("click", (e) => {
-    const t = e.target.closest("button");
-    if (!t) return;
-    collect();
-    if (t.dataset.delQ !== undefined) questions.splice(Number(t.dataset.delQ), 1);
-    if (t.dataset.addOpt !== undefined) questions[Number(t.dataset.addOpt)].options.push("");
-    if (t.dataset.delOpt !== undefined) {
-      const [qi, oi] = t.dataset.delOpt.split(":").map(Number);
-      const q = questions[qi];
-      q.options.splice(oi, 1);
-      if (q.correct === oi) q.correct = null;
-      else if (q.correct > oi) q.correct -= 1;
-    }
-    draw();
-  });
-  form.querySelector("[data-add-q]").addEventListener("click", () => {
-    collect();
-    questions.push(blankQuestion());
-    draw();
-    box.lastElementChild?.querySelector("[data-q]")?.focus();
-  });
-  draw();
 }
 
 // =====================================================================

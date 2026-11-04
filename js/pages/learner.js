@@ -8,7 +8,7 @@
 //   #/preview/new/...          as a new learner (every program, welcome steps treated as done)
 //   #/preview/<learner id>/... as a specific learner, with their real progress
 import { sb } from "../supabase.js";
-import { esc, toast, openModal, icons, stepIcon, fmtDate, fmtDateTime, PROGRAM_TYPE, STEP_TYPE } from "../ui.js";
+import { esc, toast, openModal, icons, stepIcon, fmtDate, fmtDateTime, PROGRAM_TYPE, STEP_TYPE, LIKERT } from "../ui.js";
 import { newMessage } from "./messages.js";
 
 const UPLOAD_BUCKET = "learner-uploads";
@@ -53,6 +53,7 @@ function route(main, ctx, params) {
   if (!programId) return dashboard(main);
   if (view === "module") return modulePlayer(main, ctx, programId, stepId);
   if (view === "assessment") return assessmentPage(main, ctx, programId, stepId);
+  if (view === "survey") return surveyPage(main, ctx, programId, stepId);
   return programPage(main, ctx, programId);
 }
 
@@ -100,13 +101,17 @@ async function loadEnrollments(programId = null) {
     ? await sb.from("step_links").select("step_id, url").in("step_id", stepIds)
     : { data: [] };
   const linkByStep = Object.fromEntries((links ?? []).map((l) => [l.step_id, l.url]));
+  const { data: formQs } = stepIds.length
+    ? await sb.from("assessment_questions").select("step_id").in("step_id", stepIds)
+    : { data: [] };
+  const formSteps = new Set((formQs ?? []).map((q) => q.step_id));
 
   return enrollments.map((e) => {
     const mySteps = (steps ?? []).filter((s) => s.program_id === e.program_id);
     const progressByStep = Object.fromEntries((progress ?? []).filter((p) => p.enrollment_id === e.id).map((p) => [p.step_id, p]));
     const uploadsByStep = {};
     for (const u of (uploads ?? []).filter((u) => u.enrollment_id === e.id)) (uploadsByStep[u.step_id] ??= []).push(u);
-    const view = { ...e, steps: mySteps, progressByStep, uploadsByStep, linkByStep };
+    const view = { ...e, steps: mySteps, progressByStep, uploadsByStep, linkByStep, formSteps };
     view.steps = mySteps.map((s) => ({ ...s, state: stepState(s, view) }));
     const required = view.steps.filter((s) => s.is_required);
     view.done = required.filter((s) => s.state.key === "done").length;
@@ -136,6 +141,7 @@ function stepState(step, e) {
       ? "Watch The Welcome Video First" : "Read The Required Reading First" };
   }
   if (step.unlock_at && new Date(step.unlock_at) > new Date()) return { key: "locked", label: `Opens ${fmtDateTime(step.unlock_at)}` };
+  if (step.close_at && new Date(step.close_at) < new Date()) return { key: "locked", label: "Closed" };
   if (step.step_type === "upload" && latestUpload?.status === "pending") return { key: "review", label: "Waiting For L&D Review" };
   if (step.step_type === "upload" && latestUpload?.status === "rejected") return { key: "redo", label: "Returned: Please Upload Again" };
   if (p?.status === "in_progress") return { key: "open", label: "In Progress" };
@@ -494,6 +500,7 @@ function learnerStep(s, i, e) {
   const base = `${mode.base}/${e.program_id}`;
 
   let action = "";
+  if (st.key === "done" && s.step_type === "assessment") action = `<a class="btn" href="${base}/assessment/${s.id}">View Results</a>`;
   if (open || (st.key === "done" && s.step_type === "module")) {
     if (s.step_type === "module") {
       action = url ? `<a class="btn ${st.key === "done" ? "" : "primary"}" href="${base}/module/${s.id}">${st.key === "done" ? "Review Module" : p?.status === "in_progress" ? "Continue Module" : "Start Module"}</a>`
@@ -504,8 +511,9 @@ function learnerStep(s, i, e) {
     if (s.step_type === "ilt_session") {
       action = url ? `<a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener" data-act="join" data-step="${s.id}">Join On Teams</a>` : "";
     }
-    if (s.step_type === "assessment") action = `<a class="btn primary" href="${base}/assessment/${s.id}">${p ? "Try Again" : "Start Assessment"}</a>`;
-    if (s.step_type === "survey") {
+    if (s.step_type === "assessment") action = `<a class="btn primary" href="${base}/assessment/${s.id}">${p ? "Continue Assessment" : "Start Assessment"}</a>`;
+    if (s.step_type === "survey" && e.formSteps.has(s.id)) action = `<a class="btn primary" href="${base}/survey/${s.id}">Start Survey</a>`;
+    else if (s.step_type === "survey") {
       action = `${url ? `<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open Survey</a>` : ""}
         <button class="btn primary" data-act="survey-done" data-step="${s.id}">I've Completed It</button>`;
     }
@@ -831,89 +839,394 @@ function setUpFullScreen(main) {
 }
 
 // =====================================================================
-// Assessment (scored on the server; answers never reach the browser)
+// Assessments and surveys (built in the Companion)
 // =====================================================================
+async function loadForm(stepId) {
+  const [{ data: step }, { data: sections }, { data: questions }] = await Promise.all([
+    sb.from("program_steps").select("*").eq("id", stepId).maybeSingle(),
+    sb.from("form_sections").select("*").eq("step_id", stepId).order("position"),
+    sb.from("assessment_questions").select("id, section_id, position, qtype, question, description, options, points, required").eq("step_id", stepId).order("position"),
+  ]);
+  const sectionOrder = Object.fromEntries((sections ?? []).map((s) => [s.id, s.position]));
+  const sorted = (questions ?? []).slice().sort((a, b) =>
+    (sectionOrder[a.section_id] ?? -1) - (sectionOrder[b.section_id] ?? -1) || a.position - b.position);
+  return { step, sections: sections ?? [], questions: sorted };
+}
+
+async function myEnrollment(programId) {
+  if (!mode.learnerId) return null;
+  const { data } = await sb.from("enrollments").select("id").eq("program_id", programId).eq("learner_id", mode.learnerId).maybeSingle();
+  return data;
+}
+
+const isBlank = (v) => v == null || v === "" || (Array.isArray(v) && !v.length);
+const formHeader = (back, title, sub = "") => `
+  <header class="topbar"><div>
+    <a class="back-link" href="${back}">${icons.back} Back To Program</a>
+    <h1>${esc(title)}</h1>${sub ? `<p>${sub}</p>` : ""}
+  </div></header>`;
+
+// One question, ready to answer. `order` lists the choices in the order to show (original numbers).
+function questionField(q, n, { order = null, readonly = false } = {}) {
+  const name = `q-${q.id}`;
+  const dis = readonly ? "disabled" : "";
+  const choices = (order ?? q.options.map((_, i) => i));
+  let body = "";
+  if (q.qtype === "single" || q.qtype === "truefalse") {
+    body = choices.map((i) => `<label class="choice"><input type="radio" name="${name}" value="${i}" ${dis}> <span>${esc(q.options[i])}</span></label>`).join("");
+  } else if (q.qtype === "multi") {
+    body = `<p class="muted small" style="margin:0">Select all that apply.</p>${choices.map((i) => `<label class="choice"><input type="checkbox" name="${name}" value="${i}" ${dis}> <span>${esc(q.options[i])}</span></label>`).join("")}`;
+  } else if (q.qtype === "short" || q.qtype === "text") {
+    body = `<input class="input" name="${name}" autocomplete="off" placeholder="Your answer" ${dis}>`;
+  } else if (q.qtype === "paragraph") {
+    body = `<textarea class="input prose" name="${name}" placeholder="Your answer" ${dis}></textarea>`;
+  } else if (q.qtype === "rating") {
+    body = `<div class="rate">${[5, 4, 3, 2, 1].map((v) => `<input type="radio" id="${name}-${v}" name="${name}" value="${v}" ${dis}><label for="${name}-${v}" title="${v} star${v === 1 ? "" : "s"}">${icons.star}</label>`).join("")}</div>`;
+  } else if (q.qtype === "likert") {
+    body = `<div class="scale">${LIKERT.map((l, i) => `<label class="scale-opt"><input type="radio" name="${name}" value="${i}" ${dis}><span>${l}</span></label>`).join("")}</div>`;
+  } else if (q.qtype === "nps") {
+    body = `<div class="scale nps-scale">${Array.from({ length: 11 }, (_, v) => `<label class="scale-opt"><input type="radio" name="${name}" value="${v}" ${dis}><span>${v}</span></label>`).join("")}</div>
+      <div class="scale-ends muted small"><span>Not at all likely</span><span>Extremely likely</span></div>`;
+  }
+  return `
+    <fieldset class="card question" data-qid="${q.id}">
+      <legend><span class="q-no">${n}</span> <span>${esc(q.question)}${q.required ? ' <span class="req" title="Required">*</span>' : ""}</span>
+        ${q.points != null && q.points !== 0 && ["single", "multi", "truefalse", "short"].includes(q.qtype) ? `<span class="q-pts">${Number(q.points)} pt${Number(q.points) === 1 ? "" : "s"}</span>` : ""}</legend>
+      ${q.description ? `<p class="muted small q-hint">${esc(q.description)}</p>` : ""}
+      ${body}
+      <div class="q-error" hidden>This question is required.</div>
+    </fieldset>`;
+}
+
+function readAnswers(form, questions) {
+  const out = {};
+  for (const q of questions) {
+    const name = `q-${q.id}`;
+    if (q.qtype === "multi") {
+      const vals = [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((x) => Number(x.value)).sort((a, b) => a - b);
+      if (vals.length) out[q.id] = vals;
+    } else if (["short", "text", "paragraph"].includes(q.qtype)) {
+      const v = form.querySelector(`[name="${name}"]`)?.value.trim();
+      if (v) out[q.id] = v;
+    } else {
+      const v = form.querySelector(`input[name="${name}"]:checked`);
+      if (v) out[q.id] = Number(v.value);
+    }
+  }
+  return out;
+}
+
+function fillAnswers(form, questions, saved) {
+  for (const q of questions) {
+    const v = saved?.[q.id];
+    if (isBlank(v)) continue;
+    const name = `q-${q.id}`;
+    if (q.qtype === "multi") v.forEach((x) => { const el = form.querySelector(`input[name="${name}"][value="${x}"]`); if (el) el.checked = true; });
+    else if (["short", "text", "paragraph"].includes(q.qtype)) { const el = form.querySelector(`[name="${name}"]`); if (el) el.value = v; }
+    else { const el = form.querySelector(`input[name="${name}"][value="${v}"]`); if (el) el.checked = true; }
+  }
+}
+
+// Marks unanswered required questions; returns how many
+function flagMissing(form, questions, answers) {
+  let missing = 0;
+  for (const q of questions) {
+    const box = form.querySelector(`[data-qid="${q.id}"]`);
+    const bad = q.required && isBlank(answers[q.id]);
+    box?.classList.toggle("missing", bad);
+    box?.querySelector(".q-error")?.toggleAttribute("hidden", !bad);
+    if (bad) missing += 1;
+  }
+  if (missing) form.querySelector(".question.missing")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  return missing;
+}
+
+function sectionsHtml(questions, sections, render) {
+  const byId = Object.fromEntries(sections.map((s) => [s.id, s]));
+  let current;
+  return questions.map((q, i) => {
+    let head = "";
+    if (q.section_id !== current) {
+      current = q.section_id;
+      const sec = byId[q.section_id];
+      if (sec && (sec.title || sec.description)) {
+        head = `<div class="form-section"><h2>${esc(sec.title ?? "")}</h2>${sec.description ? `<p class="muted">${esc(sec.description)}</p>` : ""}</div>`;
+      }
+    }
+    return head + render(q, i + 1);
+  }).join("");
+}
+
+const answerText = (q, v) => {
+  if (isBlank(v)) return "No answer";
+  if (q.qtype === "multi") return v.map((i) => q.options[i]).join(", ");
+  if (q.qtype === "single" || q.qtype === "truefalse") return q.options[v] ?? "";
+  return String(v);
+};
+
+// ---------------------------------------------------------------------
+// Assessment
+// ---------------------------------------------------------------------
 async function assessmentPage(main, ctx, programId, stepId) {
   const back = `${mode.base}/${programId}`;
-  const [{ data: step }, { data: questions }, { data: enrollment }] = await Promise.all([
-    sb.from("program_steps").select("*").eq("id", stepId).maybeSingle(),
-    sb.from("assessment_questions").select("id, question, options, points").eq("step_id", stepId).order("position"),
-    mode.learnerId
-      ? sb.from("enrollments").select("id").eq("program_id", programId).eq("learner_id", mode.learnerId).maybeSingle()
-      : Promise.resolve({ data: null }),
-  ]);
+  main.innerHTML = '<div class="empty" style="margin-top:24px"><div>Loading…</div></div>';
+  const [{ step, sections, questions }, enrollment] = await Promise.all([loadForm(stepId), myEnrollment(programId)]);
   if (!step || step.step_type !== "assessment" || (!enrollment && !mode.preview)) { location.hash = back; return; }
-  const { data: progress } = enrollment
-    ? await sb.from("step_progress").select("status, score").eq("enrollment_id", enrollment.id).eq("step_id", stepId).maybeSingle()
-    : { data: null };
 
-  const header = `
-    <header class="topbar"><div>
-      <a class="back-link" href="${back}">${icons.back} Back To Program</a>
-      <h1>${esc(step.title)}</h1>
-      <p>${questions?.length ?? 0} question${questions?.length === 1 ? "" : "s"}${step.passing_score != null ? ` · Pass mark ${Number(step.passing_score)}%` : ""}${progress?.score != null ? ` · Your best so far: ${Number(progress.score)}%` : ""}</p>
-    </div></header>`;
+  const { data: attempts } = enrollment
+    ? await sb.from("assessment_attempts").select("*").eq("enrollment_id", enrollment.id).eq("step_id", stepId).order("started_at")
+    : { data: [] };
+  const finished = (attempts ?? []).filter((a) => a.status !== "in_progress" && a.percent != null);
+  const open = (attempts ?? []).find((a) => a.status === "in_progress" && (!a.deadline_at || new Date(a.deadline_at).getTime() + 120000 > Date.now()));
+  const used = (attempts ?? []).filter((a) => a.status !== "manual").length;
+  const best = finished.length ? Math.max(...finished.map((a) => Number(a.percent))) : null;
+  const passed = finished.some((a) => a.passed);
+  const left = step.max_attempts ? Math.max(0, step.max_attempts - used) : null;
+  const now = Date.now();
+  const notOpen = step.unlock_at && new Date(step.unlock_at).getTime() > now;
+  const closed = step.close_at && new Date(step.close_at).getTime() < now;
+  const points = questions.reduce((a, q) => a + Number(q.points || 0), 0);
 
-  if (!questions?.length) {
-    main.innerHTML = `${header}<div class="empty"><div><strong>This Assessment Isn't Open</strong>It may not have started yet, or the L&amp;D team is still preparing it.</div></div>`;
-    return;
-  }
-  if (progress?.status === "completed") {
-    main.innerHTML = `${header}<div class="card result good"><h2>You've Passed This Assessment</h2><p>Your score: <b>${Number(progress.score)}%</b></p><a class="btn" href="${back}">Back To Program</a></div>`;
-    return;
-  }
+  let status;
+  if (passed) status = `<div class="result good"><h2>You Passed 🎉</h2><p>Your best score: <b>${best}%</b></p></div>`;
+  else if (notOpen) status = `<div class="notice info">This assessment opens ${esc(fmtDateTime(step.unlock_at))}.</div>`;
+  else if (closed) status = `<div class="notice">This assessment closed on ${esc(fmtDateTime(step.close_at))}.${best != null ? ` Your best score: <b>${best}%</b>.` : ""}</div>`;
+  else if (left === 0 && !open) status = `<div class="notice">You've used all your attempts.${best != null ? ` Your best score: <b>${best}%</b>.` : ""} Contact the L&amp;D team if you need help.</div>`;
+  else if (!questions.length) status = '<div class="notice info">This assessment isn\'t ready yet. Please check back later.</div>';
 
-  main.innerHTML = `${header}
+  main.innerHTML = `
+    ${formHeader(back, step.title)}
+    <section class="card quiz-intro">
+      ${step.description ? `<div class="prose-text">${esc(step.description)}</div>` : ""}
+      <div class="chips light">
+        <span class="chip">${icons.assessment} ${questions.length} Question${questions.length === 1 ? "" : "s"} · ${points} Point${points === 1 ? "" : "s"}</span>
+        <span class="chip">${icons.clock} ${step.time_limit_minutes ? `${step.time_limit_minutes} Minute Time Limit` : "No Time Limit"}</span>
+        ${step.passing_score != null ? `<span class="chip">${icons.flag} Pass Mark ${Number(step.passing_score)}%</span>` : ""}
+        <span class="chip">${icons.route} ${step.max_attempts ? `${left} Of ${step.max_attempts} Attempt${step.max_attempts === 1 ? "" : "s"} Left` : "Unlimited Attempts"}</span>
+        ${step.close_at ? `<span class="chip">${icons.calendar} Closes ${esc(fmtDateTime(step.close_at))}</span>` : ""}
+      </div>
+      ${status ?? `
+        ${step.time_limit_minutes ? `<p class="muted">The timer starts when you click ${open ? "Continue" : "Start"}. Your answers are submitted automatically when time runs out.</p>` : ""}
+        <button class="btn primary" data-start>${mode.preview ? "Try It (Preview)" : open ? "Continue Assessment →" : "Start Assessment →"}</button>`}
+    </section>
+    ${finished.length ? `
+      <h2 class="section-title" style="margin-top:20px">Your Attempts</h2>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>#</th><th>Submitted</th><th>Score</th><th>Result</th></tr></thead>
+        <tbody>${finished.map((a, i) => `<tr><td>${i + 1}</td><td>${esc(fmtDateTime(a.submitted_at))}</td><td><b>${Number(a.percent)}%</b></td>
+          <td><span class="pill ${a.passed ? "good" : ""}">${a.status === "expired" ? "Time Ran Out" : a.passed ? "Passed" : "Not Passed"}</span></td></tr>`).join("")}</tbody>
+      </table></div>` : ""}`;
+
+  main.querySelector("[data-start]")?.addEventListener("click", async (ev) => {
+    if (mode.preview) {
+      return takeQuiz(main, step, sections, questions, { attempt_id: null, deadline_at: null, order: null }, back);
+    }
+    ev.currentTarget.disabled = true;
+    const { data, error } = await sb.rpc("start_assessment", { p_step: stepId });
+    if (error) { toast(error.message, "err"); ev.currentTarget.disabled = false; return; }
+    takeQuiz(main, step, sections, questions, data, back);
+  });
+}
+
+function takeQuiz(main, step, sections, questions, attempt, back) {
+  const byId = Object.fromEntries(questions.map((q) => [q.id, q]));
+  const ordered = (attempt.order?.questions ?? questions.map((q) => q.id)).map((id) => byId[id]).filter(Boolean);
+  const optionOrder = attempt.order?.options ?? {};
+  const storeKey = attempt.attempt_id ? `lc-answers-${attempt.attempt_id}` : null;
+  const deadline = attempt.deadline_at ? new Date(attempt.deadline_at).getTime() : null;
+
+  main.innerHTML = `
+    ${formHeader(back, step.title, mode.preview ? "Learner view: you can try the questions, but nothing is submitted." : "")}
+    <div class="quiz-bar">
+      <span data-answered>0 of ${ordered.length} answered</span>
+      ${deadline ? `<span class="timer" data-timer>${icons.clock} <b>--:--</b> left</span>` : step.time_limit_minutes && mode.preview ? `<span class="timer">${icons.clock} <b>${step.time_limit_minutes}:00</b> (starts for learners)</span>` : ""}
+    </div>
     <form class="stack assessment" novalidate>
-      ${step.description ? `<div class="card prose-text">${esc(step.description)}</div>` : ""}
-      ${questions.map((q, i) => `
-        <fieldset class="card question">
-          <legend><span class="q-no">${i + 1}</span> ${esc(q.question)}</legend>
-          ${q.options.map((o, j) => `
-            <label class="choice"><input type="radio" name="${q.id}" value="${j}"> <span>${esc(o)}</span></label>`).join("")}
-        </fieldset>`).join("")}
+      ${sectionsHtml(ordered, sections, (q, n) => questionField(q, n, { order: optionOrder[q.id] ?? null }))}
       <div class="form-error" hidden></div>
-      <div class="form-actions">${mode.preview
-        ? '<span class="muted">Learner view: answers can\'t be submitted here.</span><button class="btn primary" type="submit" disabled>Submit Answers</button>'
-        : '<button class="btn primary" type="submit">Submit Answers</button>'}</div>
+      <div class="form-actions">
+        ${mode.preview ? '<span class="muted" style="margin-right:auto">Learner view: answers can\'t be submitted here.</span><button class="btn primary" type="submit" disabled>Submit Answers</button>'
+          : '<button class="btn primary" type="submit">Submit Answers</button>'}
+      </div>
     </form>`;
 
   const form = main.querySelector("form");
-  form.addEventListener("submit", (ev) => {
-    ev.preventDefault();
-    const answers = {};
-    const missing = [];
-    questions.forEach((q, i) => {
-      const picked = form.querySelector(`input[name="${q.id}"]:checked`);
-      if (picked) answers[q.id] = Number(picked.value);
-      else missing.push(i + 1);
-    });
-    const errorBox = form.querySelector(".form-error");
-    if (missing.length) {
-      errorBox.textContent = `Please answer question${missing.length > 1 ? "s" : ""} ${missing.join(", ")}.`;
-      errorBox.hidden = false;
+  const answeredEl = main.querySelector("[data-answered]");
+  const count = () => {
+    const a = readAnswers(form, ordered);
+    answeredEl.textContent = `${Object.keys(a).length} of ${ordered.length} answered`;
+    if (storeKey) try { localStorage.setItem(storeKey, JSON.stringify(a)); } catch { /* private window */ }
+  };
+  if (storeKey) try { fillAnswers(form, ordered, JSON.parse(localStorage.getItem(storeKey) ?? "{}")); } catch { /* nothing saved */ }
+  form.addEventListener("input", count);
+  form.addEventListener("change", count);
+  count();
+
+  let timer = null;
+  let sending = false;
+  const stop = () => clearInterval(timer);
+  window.addEventListener("hashchange", stop, { once: true });
+
+  const submit = async (auto) => {
+    if (sending || mode.preview) return;
+    const answers = readAnswers(form, ordered);
+    if (!auto && flagMissing(form, ordered, answers)) {
+      form.querySelector(".form-error").textContent = "Please answer the questions marked in red.";
+      form.querySelector(".form-error").hidden = false;
       return;
     }
+    sending = true;
+    stop();
+    const { data, error } = await sb.rpc("submit_assessment", { p_attempt: attempt.attempt_id, p_answers: answers, p_auto: !!auto });
+    sending = false;
+    if (error) { toast(error.message, "err"); return; }
+    if (storeKey) try { localStorage.removeItem(storeKey); } catch { /* ignore */ }
+    showQuizResult(main, step, ordered, answers, data, back);
+  };
+
+  if (deadline) {
+    const el = main.querySelector("[data-timer]");
+    let warned5 = false;
+    let warned1 = false;
+    const tick = () => {
+      const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+      el.querySelector("b").textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+      el.classList.toggle("warn", left <= 300);
+      el.classList.toggle("crit", left <= 60);
+      if (left <= 300 && left > 60 && !warned5) { warned5 = true; toast("5 minutes left."); }
+      if (left <= 60 && !warned1) { warned1 = true; toast("1 minute left. Your answers will be submitted automatically."); }
+      if (left === 0) { toast("Time's up. Submitting your answers…"); submit(true); }
+    };
+    tick();
+    timer = setInterval(tick, 1000);
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const answers = readAnswers(form, ordered);
+    if (flagMissing(form, ordered, answers)) {
+      form.querySelector(".form-error").textContent = "Please answer the questions marked in red.";
+      form.querySelector(".form-error").hidden = false;
+      return;
+    }
+    const blank = ordered.length - Object.keys(answers).length;
     openModal({
       title: "Submit Your Answers?",
-      intro: "You can't change them after submitting.",
+      intro: blank ? `You left ${blank} optional question${blank === 1 ? "" : "s"} blank. You can't change your answers after submitting.` : "You can't change your answers after submitting.",
       body: "",
       submitLabel: "Submit",
-      onSubmit: async () => {
-        const { data, error } = await sb.rpc("submit_assessment", { p_step: stepId, p_answers: answers });
-        if (error) throw error;
-        main.innerHTML = `${header}
-          <div class="card result ${data.passed ? "good" : "warn"}">
-            <h2>${data.passed ? "You passed!" : "Not quite there yet"}</h2>
-            <p>Your score: <b>${Number(data.percent)}%</b> (${Number(data.score)} of ${Number(data.max_score)} points)</p>
-            ${data.passed ? "" : `<p class="muted">You need ${Number(step.passing_score)}% to pass. Review the material and try again.</p>`}
-            <div class="row-actions">
-              <a class="btn ${data.passed ? "primary" : ""}" href="${back}">Back To Program</a>
-              ${data.passed ? "" : '<button class="btn primary" data-retry>Try Again</button>'}
-            </div>
-          </div>`;
-        main.querySelector("[data-retry]")?.addEventListener("click", () => assessmentPage(main, ctx, programId, stepId));
-      },
+      onSubmit: () => submit(false),
     });
+  });
+}
+
+function showQuizResult(main, step, ordered, answers, data, back) {
+  const again = `${back}/assessment/${step.id}`;
+  if (data.expired) {
+    main.innerHTML = `${formHeader(back, step.title)}
+      <div class="card result warn"><h2>Time Ran Out</h2><p>Your answers weren't submitted in time, so this attempt scored 0%.</p>
+        <div class="row-actions"><a class="btn" href="${back}">Back To Program</a><a class="btn primary" href="${again}">See Your Attempts</a></div></div>`;
+    assessmentPageAgain(main, again);
+    return;
+  }
+  main.innerHTML = `${formHeader(back, step.title)}
+    <div class="card result ${data.passed ? "good" : "warn"}">
+      <h2>${data.passed ? "You Passed! 🎉" : "Not Quite There Yet"}</h2>
+      <div class="score-big"><b>${Number(data.percent)}%</b><span class="muted">${Number(data.score)} of ${Number(data.max_score)} points</span></div>
+      ${data.passed ? "" : step.passing_score != null ? `<p class="muted">You need ${Number(step.passing_score)}% to pass. Review the material and try again if you have attempts left.</p>` : ""}
+      <div class="row-actions">
+        <a class="btn ${data.passed ? "primary" : ""}" href="${back}">Back To Program</a>
+        ${data.passed ? "" : `<a class="btn primary" href="${again}">Try Again</a>`}
+      </div>
+    </div>
+    <h2 class="section-title" style="margin-top:20px">Your Answers</h2>
+    <div class="stack review">${ordered.map((q, i) => {
+      const earned = Number(data.results?.[q.id] ?? 0);
+      const right = earned > 0;
+      const correct = data.correct?.[q.id];
+      const correctText = correct == null ? "" : q.qtype === "short" ? correct.join(" or ") : correct.map((x) => q.options[x]).join(", ");
+      return `<div class="card review-item ${right ? "right" : "wrong"}">
+        <div class="review-head"><span class="q-no">${i + 1}</span><strong>${esc(q.question)}</strong>
+          <span class="pill ${right ? "good" : "crit"}">${right ? "✓ Correct" : "✗ Incorrect"} · ${earned} / ${Number(q.points)}</span></div>
+        <div class="muted small">Your answer: <b>${esc(answerText(q, answers[q.id]))}</b></div>
+        ${!right && correctText ? `<div class="small">Correct answer: <b>${esc(correctText)}</b></div>` : ""}
+      </div>`;
+    }).join("")}</div>`;
+  assessmentPageAgain(main, again);
+}
+
+// After a result, the "Try Again" link points at the page already open; reload it on click
+function assessmentPageAgain(main, href) {
+  main.querySelectorAll(`a[href="${href}"]`).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); window.dispatchEvent(new HashChangeEvent("hashchange")); }));
+}
+
+// ---------------------------------------------------------------------
+// Survey
+// ---------------------------------------------------------------------
+async function surveyPage(main, ctx, programId, stepId) {
+  const back = `${mode.base}/${programId}`;
+  main.innerHTML = '<div class="empty" style="margin-top:24px"><div>Loading…</div></div>';
+  const [{ step, sections, questions }, enrollment] = await Promise.all([loadForm(stepId), myEnrollment(programId)]);
+  if (!step || step.step_type !== "survey" || (!enrollment && !mode.preview)) { location.hash = back; return; }
+  const { data: progress } = enrollment
+    ? await sb.from("step_progress").select("status").eq("enrollment_id", enrollment.id).eq("step_id", stepId).maybeSingle()
+    : { data: null };
+  const now = Date.now();
+  const thanks = (msg) => `${formHeader(back, step.title)}
+    <div class="card thanks"><div class="thanks-icon">${icons.check}</div><h2>${esc(msg)}</h2>
+      <p class="muted">Your answers have been sent to the L&amp;D team.</p><a class="btn primary" href="${back}">Back To Program</a></div>`;
+
+  if (progress?.status === "completed") { main.innerHTML = thanks("You've Answered This Survey. Thank You!"); return; }
+  let blocked = "";
+  if (step.unlock_at && new Date(step.unlock_at).getTime() > now) blocked = `This survey opens ${esc(fmtDateTime(step.unlock_at))}.`;
+  else if (step.close_at && new Date(step.close_at).getTime() < now) blocked = `This survey closed on ${esc(fmtDateTime(step.close_at))}.`;
+  else if (!questions.length) blocked = "This survey isn't ready yet. Please check back later.";
+  if (blocked) { main.innerHTML = `${formHeader(back, step.title)}<div class="notice info">${blocked}</div>`; return; }
+
+  const identity = {
+    choose: `<fieldset class="card identity">
+        <legend>Share Your Name? <span class="req">*</span></legend>
+        <label class="id-opt"><input type="radio" name="share" value="yes"><span><b>Share My Name</b><span class="muted small">The L&amp;D team sees your name with your answers.</span></span></label>
+        <label class="id-opt"><input type="radio" name="share" value="no"><span><b>Stay Anonymous</b><span class="muted small">The L&amp;D team sees your answers without your name.</span></span></label>
+        <div class="q-error" hidden>Please choose one.</div>
+      </fieldset>`,
+    anonymous: '<div class="notice info">This survey is anonymous. Your name isn\'t shared with your answers.</div>',
+    named: '<div class="notice info">Your name is shared with the L&amp;D team along with your answers.</div>',
+  }[step.identity_mode ?? "choose"];
+
+  main.innerHTML = `
+    ${formHeader(back, step.title, mode.preview ? "Learner view: you can try the questions, but nothing is submitted." : "")}
+    <form class="stack assessment survey" novalidate>
+      ${step.description ? `<div class="card prose-text">${esc(step.description)}</div>` : ""}
+      ${sectionsHtml(questions, sections, (q, n) => questionField(q, n))}
+      ${identity}
+      <div class="form-error" hidden></div>
+      <div class="form-actions">
+        ${mode.preview ? '<span class="muted" style="margin-right:auto">Learner view: answers can\'t be submitted here.</span><button class="btn primary" type="submit" disabled>Submit</button>'
+          : '<button class="btn primary" type="submit">Submit</button>'}
+      </div>
+    </form>`;
+
+  const form = main.querySelector("form");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (mode.preview) return;
+    const answers = readAnswers(form, questions);
+    let missing = flagMissing(form, questions, answers);
+    const share = form.querySelector('input[name="share"]:checked')?.value;
+    const idBox = form.querySelector(".identity");
+    if (idBox) {
+      idBox.classList.toggle("missing", !share);
+      idBox.querySelector(".q-error").hidden = !!share;
+      if (!share) { missing += 1; if (missing === 1) idBox.scrollIntoView({ behavior: "smooth", block: "center" }); }
+    }
+    const errorBox = form.querySelector(".form-error");
+    if (missing) { errorBox.textContent = "Please answer the questions marked in red."; errorBox.hidden = false; return; }
+    const btn = form.querySelector('[type="submit"]');
+    btn.disabled = true;
+    const { error } = await sb.rpc("submit_survey", { p_step: stepId, p_answers: answers, p_share_name: share === "yes" });
+    if (error) { btn.disabled = false; errorBox.textContent = error.message; errorBox.hidden = false; return; }
+    main.innerHTML = thanks(step.thank_you || "Thank You For Your Feedback!");
+    toast("Survey submitted.");
   });
 }

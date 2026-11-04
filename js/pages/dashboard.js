@@ -32,7 +32,7 @@ async function loadData() {
     all(() => sb.from("v_enrollment_progress").select("*")),
     all(() => sb.from("program_steps").select("id, program_id, position, step_type, title, is_required, passing_score").order("position")),
     all(() => sb.from("step_progress").select("enrollment_id, step_id, status, score, started_at, completed_at")),
-    all(() => sb.from("assessment_attempts").select("enrollment_id, step_id, score, max_score, percent, passed, submitted_at")),
+    all(() => sb.from("assessment_attempts").select("enrollment_id, step_id, status, score, max_score, percent, passed, submitted_at")),
     all(() => sb.from("uploads").select("enrollment_id, step_id, file_name, status, uploaded_at, reviewed_at, review_comment, reviewer:profiles!uploads_reviewed_by_fkey(full_name)")),
     all(() => sb.from("message_threads").select("id, program_id, status")),
   ]);
@@ -70,7 +70,8 @@ function compute(d) {
   const steps = d.steps.filter((s) => programById[s.program_id]);
   const stepById = Object.fromEntries(steps.map((s) => [s.id, s]));
   const stepProgress = d.stepProgress.filter((p) => enrollmentById[p.enrollment_id]);
-  const attempts = d.attempts.filter((a) => enrollmentById[a.enrollment_id]);
+  // Finished attempts only (not ones still being taken)
+  const attempts = d.attempts.filter((a) => enrollmentById[a.enrollment_id] && a.status !== "in_progress" && a.percent != null);
   const uploads = d.uploads.filter((u) => enrollmentById[u.enrollment_id]);
 
   // --- Learners (one row per enrolment) ---
