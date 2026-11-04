@@ -198,6 +198,30 @@ function compute(d) {
 
   const trend = buckets(completedInPeriod.map((p) => p.completed_at), start);
 
+  // Extra figures for the screen layout
+  const count = (st) => learners.filter((l) => l.status === st).length;
+  const statusMix = ["Completed", "In Progress", "Due Soon", "Overdue", "Not Started"].map((st) => ({ label: st, value: count(st) }));
+  const pendingReviews = uploads.filter((u) => u.status === "pending").length;
+  const openMessages = d.threads.filter((t) => t.status === "open" && (!t.program_id || programById[t.program_id])).length;
+  const attention = learners.filter((l) => l.status === "Overdue" || l.status === "Due Soon")
+    .sort((a, b) => (a.status === b.status ? String(a.due).localeCompare(String(b.due)) : a.status === "Overdue" ? -1 : 1));
+  const summary = {
+    live: programs.filter((p) => p.status === "live").length,
+    programs: programs.length,
+    learners: new Set(enrollments.map((e) => e.learner_id)).size,
+    enrolments: enrollments.length,
+    avgPct: learners.length ? Math.round(learners.reduce((a, l) => a + l.pct, 0) / learners.length) : 0,
+    finished: count("Completed"),
+    finishedInPeriod: learnersFinishedInPeriod,
+    stepsInPeriod: completedInPeriod.length,
+    avgScore: attemptsInPeriod.length ? Math.round(attemptsInPeriod.reduce((a, t) => a + Number(t.percent), 0) / attemptsInPeriod.length) : null,
+    passRate: attemptsInPeriod.length ? Math.round((attemptsInPeriod.filter((t) => t.passed).length / attemptsInPeriod.length) * 100) : null,
+    attempts: attemptsInPeriod.length,
+    overdue: count("Overdue"), dueSoon: count("Due Soon"),
+    pendingReviews, openMessages,
+    fb: fbPeriod, surveyRate: surveyAssigned ? Math.round((surveyDone / surveyAssigned) * 100) : null,
+  };
+
   // Raw lists for the Excel file
   const attemptRows = attempts.map((a) => {
     const e = enrollmentById[a.enrollment_id];
@@ -211,7 +235,7 @@ function compute(d) {
       uploaded: u.uploaded_at, reviewedBy: u.reviewer?.full_name ?? "", reviewed: u.reviewed_at, comment: u.review_comment ?? "" };
   });
 
-  return { kpis, feedback, surveyRows, trend, programRows, learners, stepRows, attemptRows, uploadRows, start };
+  return { kpis, feedback, surveyRows, trend, programRows, learners, stepRows, attemptRows, uploadRows, start, statusMix, attention, summary };
 }
 
 // Count completions per day / week / month, depending on the period
@@ -253,7 +277,10 @@ function buckets(dates, start) {
     }
     const from = cursor.getTime();
     const to = next.getTime();
-    out.push({ label, value: dates.filter((x) => { const t = new Date(x).getTime(); return t >= from && t < to; }).length });
+    const full = unit === "month" ? cursor.toLocaleDateString(undefined, { month: "long", year: "numeric" })
+      : unit === "week" ? `Week of ${cursor.toLocaleDateString(undefined, { day: "numeric", month: "short" })}`
+      : cursor.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+    out.push({ label, full, value: dates.filter((x) => { const t = new Date(x).getTime(); return t >= from && t < to; }).length });
     cursor.setTime(to);
   }
   return { unit, points: out };
@@ -324,51 +351,166 @@ const STATUS_PILL = { Completed: "good", Overdue: "crit", "Due Soon": "warn", "I
 const pct = (v) => (v == null ? '<span class="muted">–</span>' : `${v}%`);
 const meter = (v) => `<div class="meter"><i style="width:${v}%"></i></div> ${v}%`;
 
+const STATUS_COLOR = { Completed: "#4fb3b8", "In Progress": "#2a7fc0", "Due Soon": "#e6a532", Overdue: "#d0504a", "Not Started": "#c9d5df" };
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+// Five stars, filled to the average (e.g. 4.3)
+const stars = (r) => `<span class="star-meter" style="--fill:${r == null ? 0 : (r / 5) * 100}%" aria-label="${r ?? 0} out of 5"><span>★★★★★</span><span>★★★★★</span></span>`;
+
+function trendChart(t) {
+  const pts = t.points;
+  const max = Math.max(4, ...pts.map((p) => p.value));
+  const top = Math.ceil(max / 4) * 4;
+  const every = Math.ceil(pts.length / 12);
+  const total = pts.reduce((a, p) => a + p.value, 0);
+  const best = pts.reduce((a, p) => (p.value > a.value ? p : a), { value: 0 });
+  return `
+    <div class="chart-stats"><div><b>${total}</b><span>Total</span></div>
+      <div><b>${best.value ? esc(best.full) : "–"}</b><span>Busiest ${t.unit === "day" ? "Day" : t.unit === "week" ? "Week" : "Month"}${best.value ? ` (${plural(best.value, "step")})` : ""}</span></div></div>
+    <div class="cols">
+      <div class="cols-axis">${[4, 3, 2, 1, 0].map((i) => `<span>${(top / 4) * i}</span>`).join("")}</div>
+      <div class="cols-plot" style="--n:${pts.length}">
+        ${pts.map((p, i) => `
+          <div class="col" title="${esc(p.full)}: ${plural(p.value, "step")}">
+            <i style="height:${(p.value / top) * 100}%">${p.value ? `<em>${p.value}</em>` : ""}</i>
+            <span>${i % every === 0 ? esc(p.label) : ""}</span>
+          </div>`).join("")}
+      </div>
+    </div>`;
+}
+
+function statusDonut(mix) {
+  const total = mix.reduce((a, m) => a + m.value, 0);
+  let at = 0;
+  const stops = total ? mix.filter((m) => m.value).map((m) => {
+    const from = at; at += (m.value / total) * 100;
+    return `${STATUS_COLOR[m.label]} ${from}% ${at}%`;
+  }).join(", ") : "var(--neutral-bg) 0 100%";
+  return `
+    <div class="donut-wrap">
+      <div class="donut" style="background:conic-gradient(${stops})"><span><b>${total}</b>${total === 1 ? "Enrolment" : "Enrolments"}</span></div>
+      <ul class="legend">${mix.map((m) => `
+        <li><i style="background:${STATUS_COLOR[m.label]}"></i>${m.label}<b>${m.value}</b><span>${total ? Math.round((m.value / total) * 100) : 0}%</span></li>`).join("")}
+      </ul>
+    </div>`;
+}
+
+function feedbackCard(s) {
+  const fb = s.fb;
+  const npsPos = fb.nps == null ? 50 : (fb.nps + 100) / 2;
+  return `
+    <div class="card fb-card">
+      <div class="card-head"><h2>Learner Feedback</h2><span class="muted small">${esc(PERIODS[filters.period])}, from surveys</span></div>
+      <div class="fb-rating">
+        <b>${fb.rating ?? "–"}<small> / 5</small></b>
+        <div>${stars(fb.rating)}<span class="muted small">Average rating from ${plural(fb.responses, "response")}</span></div>
+      </div>
+      <div class="fb-row">
+        <div class="fb-label"><span>Recommendation Score (NPS)</span><b>${fmtNps(fb.nps)}</b></div>
+        <div class="nps-track"><i style="left:${npsPos}%"${fb.nps == null ? ' hidden' : ""}></i></div>
+        <div class="nps-scale"><span>−100</span><span>0</span><span>+100</span></div>
+      </div>
+      <div class="fb-row">
+        <div class="fb-label"><span>Agree Or Strongly Agree</span><b>${fb.agree == null ? "–" : `${fb.agree}%`}</b></div>
+        <div class="hbar-track"><i style="width:${fb.agree ?? 0}%"></i></div>
+      </div>
+      <div class="fb-row">
+        <div class="fb-label"><span>Response Rate</span><b>${s.surveyRate == null ? "–" : `${s.surveyRate}%`}</b></div>
+        <div class="hbar-track"><i style="width:${s.surveyRate ?? 0}%"></i></div>
+      </div>
+    </div>`;
+}
+
+function attentionCard(v) {
+  const s = v.summary;
+  const items = [
+    ...v.attention.slice(0, 5).map((l) => `
+      <a class="att-item" href="#/programs/${l.programId}/learners">
+        <span class="att-dot ${l.status === "Overdue" ? "crit" : "warn"}">${icons.clock}</span>
+        <span class="att-text"><strong>${esc(l.name)}</strong><span>${esc(l.program)} · ${l.pct}% done</span></span>
+        <span class="pill ${STATUS_PILL[l.status]}">${l.status === "Overdue" ? "Overdue" : `Due ${esc(fmtDate(l.due))}`}</span>
+      </a>`),
+    s.pendingReviews ? `
+      <a class="att-item" href="#/review">
+        <span class="att-dot warn">${icons.review}</span>
+        <span class="att-text"><strong>${plural(s.pendingReviews, "Upload")} To Review</strong><span>Certificates and workbooks waiting</span></span>
+        <span class="att-go">Open ›</span>
+      </a>` : "",
+    s.openMessages ? `
+      <a class="att-item" href="#/messages">
+        <span class="att-dot prog">${icons.messages}</span>
+        <span class="att-text"><strong>${plural(s.openMessages, "Open Message")}</strong><span>Learners waiting for a reply</span></span>
+        <span class="att-go">Open ›</span>
+      </a>` : "",
+  ].filter(Boolean);
+  const more = v.attention.length - 5;
+  return `
+    <div class="card att-card">
+      <div class="card-head"><h2>Needs Attention</h2><span class="muted small">${items.length ? plural(v.attention.length + (s.pendingReviews ? 1 : 0) + (s.openMessages ? 1 : 0), "item") : ""}</span></div>
+      ${items.length ? `<div class="att-list">${items.join("")}</div>${more > 0 ? `<p class="muted small" style="margin:8px 0 0">+ ${more} more in the By Learner table below</p>` : ""}`
+        : `<div class="all-clear"><span>${icons.check}</span><div><strong>All Clear</strong><span class="muted small">No overdue learners, reviews or messages.</span></div></div>`}
+    </div>`;
+}
+
 function drawDashboard(box, v) {
-  const max = Math.max(1, ...v.trend.points.map((p) => p.value));
-  const unitWord = { day: "day", week: "week", month: "month" }[v.trend.unit];
+  const s = v.summary;
+  const tiles = [
+    { icon: icons.check, tone: "teal", label: "Steps Completed", value: s.stepsInPeriod, hint: PERIODS[filters.period] },
+    { icon: icons.assessment, tone: "sky", label: "Average Assessment Score", value: s.avgScore == null ? "–" : `${s.avgScore}%`,
+      hint: s.attempts ? `${s.passRate}% passed · ${plural(s.attempts, "attempt")}` : `No attempts ${PERIODS[filters.period].toLowerCase()}`, bar: s.avgScore },
+    { icon: icons.flag, tone: "crit", label: "Overdue Learners", value: s.overdue, hint: `${s.dueSoon} due within 7 days` },
+    { icon: icons.review, tone: "warn", label: "Waiting For Review", value: s.pendingReviews, hint: plural(s.openMessages, "open message") },
+  ];
   box.innerHTML = `
-    <div class="kpi-grid">
-      ${v.kpis.map((k) => `
-        <div class="card kpi ${k.tone ?? ""}">
-          <span class="label">${esc(k.label)}</span>
-          <b>${esc(k.value)}</b>
-          <span class="muted small">${esc(k.hint)}</span>
-        </div>`).join("")}
-    </div>
-
-    <h2 class="section-title">Learner Feedback <span class="muted small" style="font-weight:500">${esc(PERIODS[filters.period])}, from surveys</span></h2>
-    <div class="kpi-grid feedback-grid">
-      ${v.feedback.map((k) => `
-        <div class="card kpi feedback">
-          <span class="label">${esc(k.label)}</span>
-          <b>${esc(k.value)}</b>
-          <span class="muted small">${esc(k.hint)}</span>
-        </div>`).join("")}
-    </div>
-
-    <div class="chart-grid">
-      <div class="card">
-        <div class="card-head"><h2>Steps Completed</h2><span class="muted small">${esc(PERIODS[filters.period])}, by ${unitWord}</span></div>
-        <div class="bars" style="--n:${v.trend.points.length}">
-          ${v.trend.points.map((p) => `
-            <div class="bar" title="${esc(p.label)}: ${p.value}">
-              <span class="bar-value">${p.value || ""}</span>
-              <i style="height:${(p.value / max) * 100}%"></i>
-              <span class="bar-label">${esc(p.label)}</span>
-            </div>`).join("")}
+    <section class="dash-hero">
+      <div class="dash-hero-main">
+        <span class="eyebrow">${esc(PERIODS[filters.period])} Overview</span>
+        <h2>${plural(s.learners, "learner")} across ${plural(s.live, "live program")}</h2>
+        <p>${s.finishedInPeriod ? `${plural(s.finishedInPeriod, "learner")} finished a program ${PERIODS[filters.period].toLowerCase()}. ` : ""}${s.overdue ? `${plural(s.overdue, "learner")} ${s.overdue === 1 ? "is" : "are"} overdue.` : "Nobody is overdue."}</p>
+        <div class="hero-stats">
+          <div><b>${s.live}</b><span>Live Programs</span></div>
+          <div><b>${s.learners}</b><span>Learners Enrolled</span></div>
+          <div><b>${s.finished}</b><span>Programs Completed</span></div>
+          <div><b>${s.fb.rating ?? "–"}</b><span>Average Rating</span></div>
         </div>
+      </div>
+      <div class="dash-hero-ring">
+        <div class="ring anim hero-ring" style="--p:${s.avgPct}"><span><b>${s.avgPct}%</b>Average Completion</span></div>
+      </div>
+    </section>
+
+    <div class="tile-grid">
+      ${tiles.map((t) => `
+        <div class="card tile ${t.tone}">
+          <span class="tile-icon">${t.icon}</span>
+          <div><span class="label">${esc(t.label)}</span><b>${esc(t.value)}</b><span class="muted small">${esc(t.hint)}</span></div>
+        </div>`).join("")}
+    </div>
+
+    <div class="dash-grid">
+      <div class="card span2">
+        <div class="card-head"><h2>Steps Completed</h2><span class="muted small">${esc(PERIODS[filters.period])}, by ${v.trend.unit}</span></div>
+        ${trendChart(v.trend)}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Learner Status</h2><span class="muted small">All enrolments in view</span></div>
+        ${statusDonut(v.statusMix)}
       </div>
       <div class="card">
         <div class="card-head"><h2>Completion By Program</h2><span class="muted small">Average of all learners</span></div>
-        ${v.programRows.length ? `<div class="hbars">${v.programRows.map((p) => `
-          <div class="hbar"><span class="hbar-label" title="${esc(p.title)}">${esc(p.title)}</span>
-            <div class="hbar-track"><i style="width:${p.avgPct}%"></i></div><b>${p.avgPct}%</b></div>`).join("")}</div>`
+        ${v.programRows.length ? `<div class="prog-bars">${v.programRows.map((p) => `
+          <a class="prog-bar" href="#/programs/${p.id}/learners">
+            <span class="prog-bar-top"><strong title="${esc(p.title)}">${esc(p.title)}</strong><b>${p.avgPct}%</b></span>
+            <span class="hbar-track"><i style="width:${p.avgPct}%"></i></span>
+            <span class="muted small">${plural(p.learners, "learner")} · ${p.completed} completed${p.avgScore != null ? ` · avg. score ${p.avgScore}%` : ""}</span>
+          </a>`).join("")}</div>`
           : '<p class="muted">No programs in view.</p>'}
       </div>
+      ${feedbackCard(s)}
+      ${attentionCard(v)}
     </div>
 
-    <div class="tabs" style="margin-top:18px">
+    <div class="tabs" style="margin-top:22px">
       ${[["programs", "By Program"], ["learners", "By Learner"], ["steps", "By Step"]].map(([k, l]) =>
         `<a href="#" data-view="${k}" class="${filters.view === k ? "active" : ""}">${l}</a>`).join("")}
     </div>
@@ -615,7 +757,7 @@ async function exportPdf(v, data, me) {
   };
   sectionTitle("Steps Completed", `${PERIODS[filters.period]}, by ${v.trend.unit}`, y);
   y += 12;
-  const chartH = 130;
+  const chartH = 110;
   const chartW = W - M * 2;
   const pts = v.trend.points;
   const max = Math.max(1, ...pts.map((p) => p.value));
@@ -646,7 +788,7 @@ async function exportPdf(v, data, me) {
     y += 20;
   }
   rows.forEach((p) => {
-    if (y > 790) { doc.addPage(); y = 50; }
+    if (y > doc.internal.pageSize.getHeight() - 70) { doc.addPage(); y = 50; }
     doc.setFontSize(8.5);
     doc.setTextColor(...INK);
     doc.text(doc.splitTextToSize(p.title, 150)[0], M, y + 8);
@@ -660,18 +802,24 @@ async function exportPdf(v, data, me) {
     y += 18;
   });
 
-  // Tables
+  // Tables flow on one after another; a new page starts only when the current one is full
+  const H = doc.internal.pageSize.getHeight();
+  y += 16;
   const table = (title, head, body, columnStyles = {}) => {
-    doc.addPage();
-    sectionTitle(title, `${scope}  |  ${PERIODS[filters.period]}`, 50);
+    // Keep short tables in one piece; long ones start here if a few rows fit
+    const need = 50 + Math.min(Math.max(body.length, 1), 6) * 26;
+    if (y + need > H - 50) { doc.addPage(); y = 50; }
+    sectionTitle(title, `${scope}  |  ${PERIODS[filters.period]}`, y);
     doc.autoTable({
-      startY: 62, head: [head], body: body.length ? body : [[{ content: "Nothing to show yet.", colSpan: head.length }]],
-      margin: { left: M, right: M, bottom: 50 },
+      startY: y + 10, head: [head], body: body.length ? body : [[{ content: "Nothing to show yet.", colSpan: head.length }]],
+      margin: { top: 50, left: M, right: M, bottom: 50 },
       styles: { font: "helvetica", fontSize: 8, cellPadding: 5, textColor: INK, lineColor: LINE, lineWidth: 0.5 },
       headStyles: { fillColor: NAVY, textColor: 255, fontStyle: "bold" },
       alternateRowStyles: { fillColor: [246, 249, 251] },
+      rowPageBreak: "avoid",
       columnStyles,
     });
+    y = doc.lastAutoTable.finalY + 30;
   };
   const fmt = (n) => (n == null ? "–" : `${n}%`);
   table("Programs", ["Program", "Type", "Status", "Learners", "Avg. Completion", "Completed", "Overdue", "Avg. Score", "Rating", "NPS"],
@@ -694,7 +842,7 @@ async function exportPdf(v, data, me) {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(7.5);
     doc.setTextColor(...MUTED);
-    doc.text("L&D Learning Companion  |  Confidential: For Internal Use", M, H - 20);
+    doc.text("GrowthPoint  |  HRC Learning & Development  |  Confidential: For Internal Use", M, H - 20);
     doc.text(`Page ${i} of ${pages}`, W - M, H - 20, { align: "right" });
   }
 

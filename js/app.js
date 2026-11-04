@@ -1,4 +1,4 @@
-// L&D Learning Companion — sign-in, first-time password, and the page shell
+// GrowthPoint — sign-in, first-time password, and the page shell
 import { sb } from "./supabase.js";
 import { esc, toast, openModal, icons, ROLE_LABEL } from "./ui.js";
 import { renderPeople } from "./pages/people.js";
@@ -43,7 +43,7 @@ async function enter() {
   const { data: profile, error } = await sb.from("profiles").select("*").eq("user_id", user.id).maybeSingle();
   if (error || !profile || !profile.is_active) {
     await sb.auth.signOut();
-    return showSignIn("Your account isn't set up for the Learning Companion, or it has been deactivated. Please contact the L&D team.");
+    return showSignIn("Your account isn't set up for GrowthPoint, or it has been deactivated. Please contact the L&D team.");
   }
   me = profile;
   if (me.must_change_password) return showNewPassword();
@@ -69,7 +69,7 @@ function showSignIn(message = "") {
     <div class="auth">
       <div class="auth-card">
         <div class="brand-mark">${icons.brand}</div>
-        <h1>L&amp;D Learning Companion</h1>
+        <h1>GrowthPoint</h1>
         <p class="lead">Sign in with the email and password the L&amp;D team gave you.</p>
         <form id="signin" novalidate>
           <div class="form-error" ${message ? "" : "hidden"}>${esc(message)}</div>
@@ -198,7 +198,7 @@ function showApp() {
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-mark">${icons.brand}</div>
-          <div><strong>Learning Companion</strong><span>${esc(ROLE_LABEL[me.role])}</span></div>
+          <div><strong>GrowthPoint</strong><span>${esc(ROLE_LABEL[me.role])}</span></div>
         </div>
         <nav class="nav">${nav}</nav>
         <div class="sidebar-foot">
@@ -231,7 +231,7 @@ function route() {
   if (!found) history.replaceState(null, "", `#/${key}`);
 
   root.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === key));
-  document.title = `${page.title} · L&D Learning Companion`;
+  document.title = `${page.title} · GrowthPoint`;
   page.render(main, { me, params: found ? params.map(decodeURIComponent) : [] });
   refreshBadges();
 }

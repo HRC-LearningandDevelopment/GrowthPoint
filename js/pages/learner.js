@@ -1,7 +1,7 @@
 // Learner side: My learning dashboard, a program page, the module player and assessments.
 //   #/home                          dashboard
 //   #/home/<program>                program page
-//   #/home/<program>/module/<step>  module inside the Companion
+//   #/home/<program>/module/<step>  module inside GrowthPoint
 //   #/home/<program>/assessment/<step>
 //
 // Admin and L&D get the same pages read-only under "Learner view":
@@ -35,7 +35,7 @@ export async function renderPreview(main, ctx) {
   main.innerHTML = `
     <div class="preview-bar">
       <span class="pill prog">Learner View</span>
-      <span>You're seeing the Companion as a learner does. <b>Nothing you do here is saved.</b></span>
+      <span>You're seeing GrowthPoint as a learner does. <b>Nothing you do here is saved.</b></span>
       <label>View as
         <select class="select" data-as>
           <option value="new">A New Learner (Every Program)</option>
@@ -671,7 +671,7 @@ async function viewFile(path) {
 }
 
 // =====================================================================
-// Module player: the module runs inside the Companion and reports completion
+// Module player: the module runs inside GrowthPoint and reports completion
 // =====================================================================
 async function modulePlayer(main, ctx, programId, stepId) {
   const back = `${mode.base}/${programId}`;
@@ -755,7 +755,7 @@ async function modulePlayer(main, ctx, programId, stepId) {
 
 // Looks at what the learner can see in the module. When the final-screen words
 // appear, reports completion with any score shown on that screen.
-// Works when the module and the Companion are on the same website (same GitHub account).
+// Works when the module and GrowthPoint are on the same website (same GitHub account).
 function watchForFinalScreen(frame, words, onFinish) {
   const target = (words ?? "").trim().toLowerCase();
   if (!target) return () => {};
@@ -842,7 +842,7 @@ function setUpFullScreen(main) {
 }
 
 // =====================================================================
-// Assessments and surveys (built in the Companion)
+// Assessments and surveys (built in GrowthPoint)
 // =====================================================================
 async function loadForm(stepId) {
   const [{ data: step }, { data: sections }, { data: questions }] = await Promise.all([

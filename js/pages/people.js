@@ -185,7 +185,7 @@ function wireGenerate(form) {
 }
 
 function showCredentials(person, password) {
-  const text = `L&D Learning Companion\n${portalUrl()}\n\nEmail: ${person.email}\nTemporary password: ${password}\n\nYou'll be asked to set your own password when you first sign in.`;
+  const text = `GrowthPoint\n${portalUrl()}\n\nEmail: ${person.email}\nTemporary password: ${password}\n\nYou'll be asked to set your own password when you first sign in.`;
   const { form } = openModal({
     title: "Share These Sign-In Details",
     intro: `Send them to ${esc(person.full_name)} privately, for example in a Teams chat.`,
@@ -293,7 +293,7 @@ function showBulkResults(results) {
     cancelLabel: "",
   });
   form.querySelector("[data-download]")?.addEventListener("click", () => {
-    downloadCsv(`learning-companion-sign-in-details-${new Date().toLocaleDateString("en-CA")}.csv`, [
+    downloadCsv(`growthpoint-sign-in-details-${new Date().toLocaleDateString("en-CA")}.csv`, [
       ["Full Name", "Email", "Temporary Password", "Link"],
       ...created.map((r) => [r.full_name, r.email, r.password, portalUrl()]),
     ]);

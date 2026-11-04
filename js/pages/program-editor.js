@@ -227,7 +227,7 @@ async function closeAndArchive(program, reload) {
 
   const { form } = openModal({
     title: `Close & Archive “${program.title}”`,
-    intro: "Download everything first. Archiving then deletes the uploaded PDFs and the welcome video to free storage. Names, progress, scores and dates stay in the Companion for the dashboard.",
+    intro: "Download everything first. Archiving then deletes the uploaded PDFs and the welcome video to free storage. Names, progress, scores and dates stay in GrowthPoint for the dashboard.",
     wide: true,
     body: `
       <ol class="wizard">
@@ -398,7 +398,7 @@ async function closeAndArchive(program, reload) {
   }));
 }
 
-// The Companion can only see a module's screen when both are on the same website
+// GrowthPoint can only see a module's screen when both are on the same website
 // (the same GitHub account), e.g. https://<account>.github.io/...
 const sameSite = (url) => { try { return new URL(url).origin === location.origin; } catch { return false; } };
 

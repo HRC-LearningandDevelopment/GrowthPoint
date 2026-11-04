@@ -72,7 +72,7 @@ export async function renderFormBuilder(main, program, stepId) {
       <div>
         <a class="back-link" href="${back}">${icons.back} ${esc(program.title)}</a>
         <h1>${isQuiz ? "Build Assessment" : "Build Survey"}: ${esc(step.title)}</h1>
-        <p>${isQuiz ? "Add sections and questions, mark the correct answers and set the points." : "Add sections and questions. Learners answer inside the Companion."}</p>
+        <p>${isQuiz ? "Add sections and questions, mark the correct answers and set the points." : "Add sections and questions. Learners answer inside GrowthPoint."}</p>
       </div>
       <div class="top-actions">
         <button class="btn" data-template>${icons.download} Download Template</button>

@@ -1,4 +1,4 @@
-// Supabase project for the L&D Learning Companion.
+// Supabase project for GrowthPoint.
 // Both values are safe to publish: the database security rules protect the data.
 // NEVER put the secret key (sb_secret_… / service_role) in this file.
 export const SUPABASE_URL = "https://vfsfovwwiijrjfzmesjq.supabase.co";

@@ -178,7 +178,7 @@ export function toLocalInput(iso) {
 export const fromLocalInput = (value) => (value ? new Date(value).toISOString() : null);
 
 export const icons = {
-  // Open book with a spark of insight: the Learning Companion's mark
+  // Open book with a spark of insight: GrowthPoint's mark
   brand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M12 11c-2-1.4-5-1.9-8.5-1.4v10c3.5-.5 6.5 0 8.5 1.4 2-1.4 5-1.9 8.5-1.4v-10c-3.5-.5-6.5 0-8.5 1.4z"/><path d="M12 11v10"/><path d="M12 2.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z" fill="currentColor" stroke-width="1"/></svg>',
   home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>',
   people: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.2a5 5 0 0 1 5.5 4.8"/></svg>',
