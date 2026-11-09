@@ -1,9 +1,9 @@
 // People: create accounts, reset passwords, change email / role, deactivate, delete.
 // Admin manages everyone; L&D manages learners only (also enforced on the server).
 import { sb, manageAccount } from "../supabase.js";
-import { esc, toast, openModal, generatePassword, copyText, downloadCsv, ROLE_LABEL, icons } from "../ui.js";
+import { esc, toast, openModal, generatePassword, copyText, downloadCsv, ROLE_LABEL, icons, MARKETS, cleanMarket, LIBS, loadScript } from "../ui.js";
 
-const filters = { q: "", role: "", status: "active" };
+const filters = { q: "", role: "", status: "active", market: "", department: "" };
 let people = [];
 let me = null;
 
@@ -25,7 +25,7 @@ export async function renderPeople(main, ctx) {
       </div>
     </header>
     <div class="toolbar">
-      <input class="input search" type="search" placeholder="Search name or email" value="${esc(filters.q)}" data-f="q">
+      <input class="input search" type="search" placeholder="Search name, email, department, manager" value="${esc(filters.q)}" data-f="q">
       <select class="select" data-f="role">
         <option value="">All Roles</option>
         <option value="learner">Learners</option>
@@ -37,6 +37,8 @@ export async function renderPeople(main, ctx) {
         <option value="inactive">Deactivated</option>
         <option value="">Active And Deactivated</option>
       </select>
+      <select class="select" data-f="market"></select>
+      <select class="select" data-f="department"></select>
       <span class="count"></span>
     </div>
     <div id="people-list"><div class="empty"><div>Loading…</div></div></div>`;
@@ -55,7 +57,7 @@ export async function renderPeople(main, ctx) {
 async function load(main) {
   const { data, error } = await sb
     .from("profiles")
-    .select("id, email, full_name, role, is_active, must_change_password, user_id, created_at")
+    .select("id, email, full_name, role, is_active, must_change_password, user_id, created_at, department, designation, market, manager")
     .order("full_name");
   if (error) {
     main.querySelector("#people-list").innerHTML =
@@ -63,14 +65,29 @@ async function load(main) {
     return;
   }
   people = data;
+  fillFilter(main, "market", "All Markets", people.map((p) => p.market));
+  fillFilter(main, "department", "All Departments", people.map((p) => p.department));
   draw(main);
 }
+
+// Market / Department dropdowns list only the values in use
+function fillFilter(main, key, all, values) {
+  const el = main.querySelector(`[data-f="${key}"]`);
+  const used = [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  if (filters[key] && !used.includes(filters[key])) filters[key] = "";
+  el.innerHTML = `<option value="">${all}</option>${used.map((v) => `<option>${esc(v)}</option>`).join("")}`;
+  el.value = filters[key];
+}
+
+const missingDetails = (p) => p.role === "learner" && !(p.department && p.designation && p.market && p.manager);
 
 function draw(main) {
   const q = filters.q.trim().toLowerCase();
   const shown = people.filter((p) =>
-    (!q || p.full_name.toLowerCase().includes(q) || p.email.toLowerCase().includes(q)) &&
+    (!q || [p.full_name, p.email, p.department, p.designation, p.market, p.manager].some((v) => (v ?? "").toLowerCase().includes(q))) &&
     (!filters.role || p.role === filters.role) &&
+    (!filters.market || p.market === filters.market) &&
+    (!filters.department || p.department === filters.department) &&
     (filters.status === "" || (filters.status === "active") === p.is_active));
 
   main.querySelector(".count").textContent = `${shown.length} of ${people.length}`;
@@ -84,7 +101,7 @@ function draw(main) {
   list.innerHTML = `
     <div class="table-wrap">
       <table class="data">
-        <thead><tr><th>Name</th><th>Role</th><th>Sign-In</th><th>Status</th><th>Added</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Department</th><th>Market</th><th>Reporting Manager</th><th>Role</th><th>Sign-In</th><th>Status</th><th></th></tr></thead>
         <tbody>${shown.map(row).join("")}</tbody>
       </table>
     </div>`;
@@ -102,10 +119,14 @@ function row(p) {
   return `
     <tr class="${p.is_active ? "" : "inactive"}">
       <td class="name"><strong>${esc(p.full_name)}${self ? " (you)" : ""}</strong><span>${esc(p.email)}</span></td>
+      <td class="name">${p.department || p.designation
+        ? `<strong>${esc(p.department || "–")}</strong><span>${esc(p.designation || "")}</span>`
+        : missingDetails(p) && canManage(p) ? `<button class="pill warn pill-btn" data-act="details" data-id="${p.id}">Add Details</button>` : '<span class="muted">–</span>'}</td>
+      <td>${p.market ? esc(p.market) : '<span class="muted">–</span>'}</td>
+      <td>${p.manager ? esc(p.manager) : '<span class="muted">–</span>'}</td>
       <td><span class="pill ${roleClass}">${esc(ROLE_LABEL[p.role])}</span></td>
       <td>${signIn}</td>
       <td>${p.is_active ? '<span class="pill good">Active</span>' : '<span class="pill">Deactivated</span>'}</td>
-      <td>${new Date(p.created_at).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</td>
       <td class="actions">${canManage(p) ? actionsMenu(p, self) : ""}</td>
     </tr>`;
 }
@@ -114,7 +135,7 @@ function actionsMenu(p, self) {
   const items = [
     !p.user_id && ["create_login", "Create Login"],
     p.user_id && ["reset", "Reset Password"],
-    ["rename", "Edit Name"],
+    ["details", "Edit Details"],
     ["email", "Change Email"],
     isAdmin() && !self && ["role", "Change Role"],
     !self && (p.is_active ? ["deactivate", "Deactivate"] : ["reactivate", "Reactivate"]),
@@ -160,7 +181,7 @@ function onListClick(e, main) {
   actBtn.closest(".menu")?.classList.remove("open");
   const person = people.find((p) => p.id === actBtn.dataset.id);
   const actions = {
-    create_login: createLogin, reset: resetPassword, rename, email: changeEmail, role: changeRole,
+    create_login: createLogin, reset: resetPassword, details: editDetails, email: changeEmail, role: changeRole,
     deactivate: (p, m) => setActive(p, m, false), reactivate: (p, m) => setActive(p, m, true), delete: deletePerson,
   };
   actions[actBtn.dataset.act]?.(person, main);
@@ -197,6 +218,58 @@ function showCredentials(person, password) {
   form.querySelector("[data-copy]").addEventListener("click", () => copyText(text));
 }
 
+// Department, Designation, Market and Reporting Manager (needed for learners)
+function detailFields(p = {}) {
+  const other = p.market && !MARKETS.includes(p.market);
+  return `
+    <div class="form-grid">
+      <label class="field">Department <input class="input" name="department" value="${esc(p.department ?? "")}" list="dl-dept" autocomplete="off"></label>
+      <label class="field">Designation <input class="input" name="designation" value="${esc(p.designation ?? "")}" list="dl-desig" autocomplete="off"></label>
+      <label class="field">Market
+        <select class="select" name="market_pick">
+          <option value="">Choose…</option>
+          ${MARKETS.map((m) => `<option ${p.market === m ? "selected" : ""}>${m}</option>`).join("")}
+          <option value="other" ${other ? "selected" : ""}>Other</option>
+        </select>
+        <input class="input" name="market_other" placeholder="Type the market" value="${other ? esc(p.market) : ""}" ${other ? "" : "hidden"} style="margin-top:6px">
+      </label>
+      <label class="field">Reporting Manager <input class="input" name="manager" value="${esc(p.manager ?? "")}" list="dl-mgr" autocomplete="off"></label>
+    </div>
+    ${datalist("dl-dept", "department")}${datalist("dl-desig", "designation")}${datalist("dl-mgr", "manager")}`;
+}
+
+// Suggest values already used, so spellings stay consistent for the dashboard
+const datalist = (id, key) =>
+  `<datalist id="${id}">${[...new Set(people.map((p) => p[key]).filter(Boolean))].sort().map((v) => `<option value="${esc(v)}">`).join("")}</datalist>`;
+
+function wireDetails(form) {
+  const pick = form.market_pick;
+  pick?.addEventListener("change", () => {
+    form.market_other.hidden = pick.value !== "other";
+    if (pick.value === "other") form.market_other.focus();
+  });
+}
+
+function readDetails(f, required) {
+  const d = {
+    department: f.department.value.trim() || null,
+    designation: f.designation.value.trim() || null,
+    market: (f.market_pick.value === "other" ? cleanMarket(f.market_other.value) : f.market_pick.value) || null,
+    manager: f.manager.value.trim() || null,
+  };
+  if (required) {
+    const missing = Object.entries({ department: "Department", designation: "Designation", market: "Market", manager: "Reporting Manager" })
+      .filter(([k]) => !d[k]).map(([, l]) => l);
+    if (missing.length) throw new Error(`Please fill in: ${missing.join(", ")}.`);
+  }
+  return d;
+}
+
+async function saveDetails(profileId, details) {
+  const { error } = await sb.from("profiles").update(details).eq("id", profileId);
+  if (error) throw error;
+}
+
 function roleOptions(selected = "learner") {
   return ["learner", "ld", "admin"]
     .map((r) => `<option value="${r}" ${r === selected ? "selected" : ""}>${esc(ROLE_LABEL[r])}</option>`)
@@ -216,45 +289,59 @@ function addPerson(main) {
         ? `<label class="field">Role <select class="select" name="role">${roleOptions()}</select>
              <span class="hint">L&amp;D can build programs and manage learners. Admin can also manage L&amp;D members.</span></label>`
         : '<input type="hidden" name="role" value="learner">'}
+      ${detailFields()}
+      <span class="hint" style="margin-top:-6px">Required for learners: the dashboard reports by these.</span>
       ${passwordField()}`,
     submitLabel: "Create Account",
     onSubmit: async (f) => {
       const person = { full_name: f.full_name.value.trim(), email: f.email.value.trim().toLowerCase(), role: f.role.value };
+      const details = readDetails(f, person.role === "learner");
       const password = f.password.value.trim();
-      await manageAccount({ action: "create", ...person, password });
+      const { profile_id } = await manageAccount({ action: "create", ...person, password });
+      await saveDetails(profile_id, details);
       toast(`Account created for ${person.full_name}.`);
       await load(main);
       showCredentials(person, password);
     },
   });
   wireGenerate(form);
+  wireDetails(form);
 }
 
 // ---------------------------------------------------------------------
-// Add many (one per line: Full name, email)
+// Add many: paste rows from Excel
+// Full Name | Email | Department | Designation | Market | Reporting Manager
 // ---------------------------------------------------------------------
+const BULK_COLUMNS = ["Full Name", "Email", "Department", "Designation", "Market", "Reporting Manager"];
+
 function addMany(main) {
   const { form } = openModal({
     title: "Add Many People",
-    intro: "One person per line: <b>Full name, email</b>. You can paste two columns straight from Excel.",
+    intro: `Copy the rows from Excel and paste them below, one person per line, in this order: <b>${BULK_COLUMNS.join(" · ")}</b>.`,
     wide: true,
     body: `
-      <textarea class="input" name="lines" placeholder="Juan Dela Cruz, juan.delacruz@company.com&#10;Maria Santos, maria.santos@company.com"></textarea>
+      <button type="button" class="btn sm" data-template>${icons.download} Download Excel Template</button>
+      <textarea class="input" name="lines" rows="8" placeholder="Juan Dela Cruz&#9;juan.delacruz@company.com&#9;Operations&#9;Team Lead&#9;Philippines&#9;Maria Santos"></textarea>
       ${isAdmin()
         ? `<label class="field">Role For Everyone In This List <select class="select" name="role">${roleOptions()}</select></label>`
         : '<input type="hidden" name="role" value="learner">'}
-      <div class="notice info">Each person gets their own temporary password. When it finishes you can download everyone's sign-in details as a CSV file.</div>`,
+      <div class="notice info">Market can be US, Sri Lanka, India, Philippines, or another market. Each person gets their own temporary password, and you can download everyone's sign-in details when it finishes.</div>`,
     submitLabel: "Create Accounts",
     onSubmit: async (f) => {
-      const parsed = f.lines.value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((line) => {
-        const parts = line.split(/\t|,|;/).map((s) => s.trim()).filter(Boolean);
-        const email = parts.find((s) => s.includes("@"));
-        const full_name = parts.filter((s) => s !== email).join(" ");
-        return { line, email: (email ?? "").toLowerCase(), full_name };
+      const lines = f.lines.value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+        .filter((l) => !/^full name\b/i.test(l)); // skip a pasted header row
+      const parsed = lines.map((line) => {
+        const parts = (line.includes("\t") ? line.split("\t") : line.split(/,|;/)).map((x) => x.trim());
+        const [full_name = "", email = "", department = "", designation = "", market = "", manager = ""] = parts;
+        return { line, full_name, email: email.toLowerCase(), department, designation, market: cleanMarket(market), manager };
       });
       if (!parsed.length) throw new Error("Paste at least one line.");
-      const bad = parsed.filter((p) => !p.email || !p.full_name);
-      if (bad.length) throw new Error(`These lines need both a name and an email: ${bad.map((b) => `"${b.line}"`).join(", ")}`);
+      const learners = f.role.value === "learner";
+      const bad = parsed.filter((p) => !p.full_name || !p.email.includes("@") ||
+        (learners && !(p.department && p.designation && p.market && p.manager)));
+      if (bad.length) {
+        throw new Error(`These lines are missing ${learners ? "a column" : "a name or email"}: ${bad.slice(0, 5).map((b) => `"${b.line.replace(/\t/g, " | ")}"`).join(", ")}${bad.length > 5 ? ` and ${bad.length - 5} more` : ""}`);
+      }
 
       const submit = f.querySelector('[type="submit"]');
       const results = [];
@@ -262,7 +349,9 @@ function addMany(main) {
         submit.textContent = `Creating ${i + 1} of ${parsed.length}…`;
         const password = generatePassword();
         try {
-          await manageAccount({ action: "create", full_name: person.full_name, email: person.email, role: f.role.value, password });
+          const { profile_id } = await manageAccount({ action: "create", full_name: person.full_name, email: person.email, role: f.role.value, password });
+          const { department, designation, market, manager } = person;
+          await saveDetails(profile_id, { department: department || null, designation: designation || null, market: market || null, manager: manager || null });
           results.push({ ...person, password, ok: true });
         } catch (err) {
           results.push({ ...person, ok: false, reason: err.message });
@@ -273,6 +362,19 @@ function addMany(main) {
       showBulkResults(results);
     },
   });
+  form.querySelector("[data-template]").addEventListener("click", () => downloadTemplate());
+}
+
+async function downloadTemplate() {
+  await loadScript(LIBS.xlsx);
+  const X = window.XLSX;
+  const ws = X.utils.aoa_to_sheet([BULK_COLUMNS, ["Juan Dela Cruz", "juan.delacruz@healthreconconnect.com", "Operations", "Team Lead", "Philippines", "Maria Santos"]]);
+  ws["!cols"] = [26, 36, 22, 22, 14, 24].map((w) => ({ wch: w }));
+  const lists = X.utils.aoa_to_sheet([["Markets"], ...MARKETS.map((m) => [m]), ["(or type another market)"]]);
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, "People");
+  X.utils.book_append_sheet(wb, lists, "Markets");
+  X.writeFile(wb, "GrowthPoint People Template.xlsx");
 }
 
 function showBulkResults(results) {
@@ -294,8 +396,8 @@ function showBulkResults(results) {
   });
   form.querySelector("[data-download]")?.addEventListener("click", () => {
     downloadCsv(`growthpoint-sign-in-details-${new Date().toLocaleDateString("en-CA")}.csv`, [
-      ["Full Name", "Email", "Temporary Password", "Link"],
-      ...created.map((r) => [r.full_name, r.email, r.password, portalUrl()]),
+      ["Full Name", "Email", "Temporary Password", "Link", "Department", "Designation", "Market", "Reporting Manager"],
+      ...created.map((r) => [r.full_name, r.email, r.password, portalUrl(), r.department, r.designation, r.market, r.manager]),
     ]);
   });
 }
@@ -334,19 +436,21 @@ function resetPassword(p, main) {
   wireGenerate(form);
 }
 
-function rename(p, main) {
-  openModal({
-    title: "Edit Name",
-    body: `<label class="field">Full Name <input class="input" name="full_name" value="${esc(p.full_name)}" required></label>`,
+function editDetails(p, main) {
+  const { form } = openModal({
+    title: `Edit Details For ${p.full_name}`,
+    body: `<label class="field">Full Name <input class="input" name="full_name" value="${esc(p.full_name)}" required></label>
+           ${detailFields(p)}`,
     onSubmit: async (f) => {
       const full_name = f.full_name.value.trim();
       if (!full_name) throw new Error("Please enter a name.");
-      const { error } = await sb.from("profiles").update({ full_name }).eq("id", p.id);
-      if (error) throw error;
-      toast("Name updated.");
+      const details = readDetails(f, p.role === "learner");
+      await saveDetails(p.id, { full_name, ...details });
+      toast("Details updated.");
       await load(main);
     },
   });
+  wireDetails(form);
 }
 
 function changeEmail(p, main) {

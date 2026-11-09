@@ -207,7 +207,7 @@ function duplicateProgram(program, me) {
 // =====================================================================
 async function closeAndArchive(program, reload) {
   const [{ data: enrolled, error }, { data: steps }] = await Promise.all([
-    sb.from("enrollments").select("id, learner_id, due_date_override, enrolled_at, welcome_completed_at, reading_ack_at, learner:profiles(full_name, email)").eq("program_id", program.id),
+    sb.from("enrollments").select("id, learner_id, due_date_override, enrolled_at, welcome_completed_at, reading_ack_at, learner:profiles(full_name, email, department, designation, market, manager)").eq("program_id", program.id),
     sb.from("program_steps").select("*, step_links(url)").eq("program_id", program.id).order("position"),
   ]);
   if (error) return toast(error.message, "err");
@@ -353,12 +353,14 @@ async function closeAndArchive(program, reload) {
     const { data: exclusions } = ids.length ? await sb.from("enrollment_exclusions").select("enrollment_id, step_id").in("enrollment_id", ids) : { data: [] };
     const removedFor = (id) => new Set((exclusions ?? []).filter((x) => x.enrollment_id === id).map((x) => x.step_id));
     add("Learners", enrolled.map((e) => ({
-      Learner: e.learner.full_name, Email: e.learner.email, "Completion %": Math.round(Number(pctBy[e.id]?.percent_complete ?? 0)),
+      Learner: e.learner.full_name, Email: e.learner.email, Department: e.learner.department ?? "", Designation: e.learner.designation ?? "",
+      Market: e.learner.market ?? "", "Reporting Manager": e.learner.manager ?? "",
+      "Completion %": Math.round(Number(pctBy[e.id]?.percent_complete ?? 0)),
       "Steps Done": pctBy[e.id]?.completed_steps ?? 0, "Steps Required": pctBy[e.id]?.required_steps ?? 0,
       "Due Date": d(e.due_date_override ?? program.due_date), Enrolled: d(e.enrolled_at),
       "Watched Welcome Video": d(e.welcome_completed_at), "Read Required Reading": d(e.reading_ack_at),
       "Steps Assigned": removedFor(e.id).size ? steps.filter((s) => !removedFor(e.id).has(s.id)).map((s) => s.title).join("; ") : "All",
-    })), [26, 32, 13, 11, 14, 12, 18, 22, 22, 50]);
+    })), [26, 32, 20, 20, 13, 22, 13, 11, 14, 12, 18, 22, 22, 50]);
     add("Step Progress", progress.map((p) => ({
       Learner: who(p.enrollment_id).full_name, Email: who(p.enrollment_id).email, Step: stepById[p.step_id]?.title ?? "",
       Status: { not_started: "Not Started", in_progress: "In Progress", submitted: "Submitted", completed: "Completed", rejected: "Returned" }[p.status],
@@ -844,7 +846,7 @@ function deleteStep(step, reload) {
 async function learnersTab(area, program, reload) {
   const [{ data: enrolled, error }, { data: progress }, { data: steps }] = await Promise.all([
     sb.from("enrollments")
-      .select("id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active), enrollment_exclusions(step_id)")
+      .select("id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active, department, designation, market), enrollment_exclusions(step_id)")
       .eq("program_id", program.id),
     sb.from("v_enrollment_progress").select("enrollment_id, percent_complete, completed_steps, required_steps, last_activity").eq("program_id", program.id),
     sb.from("program_steps").select("id, position, step_type, title, is_required").eq("program_id", program.id).order("position"),
@@ -864,7 +866,7 @@ async function learnersTab(area, program, reload) {
     ${enrolled.length ? `
       <div class="table-wrap">
         <table class="data">
-          <thead><tr><th>Learner</th><th>Progress</th><th>Due Date</th><th>Last Activity</th><th></th></tr></thead>
+          <thead><tr><th>Learner</th><th>Department</th><th>Progress</th><th>Due Date</th><th>Last Activity</th><th></th></tr></thead>
           <tbody>${enrolled.map((e) => {
             const p = prog[e.id];
             const pct = Math.round(Number(p?.percent_complete ?? 0));
@@ -872,6 +874,7 @@ async function learnersTab(area, program, reload) {
             return `
               <tr class="${e.learner.is_active ? "" : "inactive"}">
                 <td class="name"><strong>${esc(e.learner.full_name)}</strong><span>${esc(e.learner.email)}</span></td>
+                <td class="name"><strong>${esc(e.learner.department || "–")}</strong><span>${esc([e.learner.designation, e.learner.market].filter(Boolean).join(" · "))}</span></td>
                 <td><div class="meter"><i style="width:${pct}%"></i></div> ${pct}% <span class="muted">(${p?.completed_steps ?? 0}/${p?.required_steps ?? 0})</span>
                   ${e.enrollment_exclusions?.length ? `<div><span class="pill teal">Custom: ${(steps ?? []).length - e.enrollment_exclusions.length} Of ${(steps ?? []).length} Steps</span></div>` : ""}</td>
                 <td>${due ? esc(fmtDate(due)) : '<span class="muted">–</span>'} ${e.due_date_override ? '<span class="pill warn">Extended</span>' : ""}</td>
@@ -951,7 +954,7 @@ function customizeSteps(enrollment, steps, reload) {
 
 async function enrollLearners(program, enrolled, reload) {
   const taken = new Set(enrolled.map((e) => e.learner_id));
-  const { data: learners, error } = await sb.from("profiles").select("id, full_name, email")
+  const { data: learners, error } = await sb.from("profiles").select("id, full_name, email, department, market, manager")
     .eq("role", "learner").eq("is_active", true).order("full_name");
   if (error) return toast(error.message, "err");
   const available = learners.filter((l) => !taken.has(l.id));
@@ -962,15 +965,15 @@ async function enrollLearners(program, enrolled, reload) {
     wide: true,
     body: available.length ? `
       <div class="toolbar" style="margin:0">
-        <input class="input search" type="search" placeholder="Search name or email" data-search>
+        <input class="input search" type="search" placeholder="Search name, email, department, market, manager" data-search>
         <label class="check"><input type="checkbox" data-all> Select All Shown</label>
         <span class="count" data-picked>0 selected</span>
       </div>
       <div class="checklist">
         ${available.map((l) => `
-          <label class="check-row" data-text="${esc(`${l.full_name} ${l.email}`.toLowerCase())}">
+          <label class="check-row" data-text="${esc([l.full_name, l.email, l.department, l.market, l.manager].join(" ").toLowerCase())}">
             <input type="checkbox" value="${l.id}">
-            <span><strong>${esc(l.full_name)}</strong><span class="muted">${esc(l.email)}</span></span>
+            <span><strong>${esc(l.full_name)}</strong><span class="muted">${esc([l.email, l.department, l.market].filter(Boolean).join(" · "))}</span></span>
           </label>`).join("")}
       </div>` : '<div class="empty"><div><strong>Everyone Is Already Enrolled</strong>Create new learner accounts on the People page.</div></div>',
     submitLabel: available.length ? "Enroll Selected" : "",

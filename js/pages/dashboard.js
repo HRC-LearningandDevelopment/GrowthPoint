@@ -7,7 +7,12 @@ import {
 } from "../ui.js";
 
 const PERIODS = { week: "This Week", month: "This Month", quarter: "This Quarter", year: "This Year", all: "All Time" };
-const filters = { period: "month", program: "", type: "", view: "programs", q: "" };
+const filters = { period: "month", program: "", type: "", market: "", department: "", designation: "", manager: "", view: "programs", q: "", groupBy: "program" };
+// Learner details the dashboard can group and filter by
+const GROUPS = { department: "Department", designation: "Designation", market: "Market", manager: "Reporting Manager" };
+const ALL_LABEL = { department: "All Departments", designation: "All Designations", market: "All Markets", manager: "All Managers" };
+const NOT_SET = "Not Set";
+const peopleFiltered = () => Object.keys(GROUPS).some((k) => filters[k]);
 const DAY = 86400000;
 const today = () => new Date().toLocaleDateString("en-CA"); // 2026-11-04, local time
 
@@ -28,7 +33,7 @@ async function all(build) {
 async function loadData() {
   const [programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads, exclusions, responses, scaleQs] = await Promise.all([
     all(() => sb.from("programs").select("id, title, program_type, status, start_date, due_date, owner:profiles!programs_owner_id_fkey(full_name)").order("title")),
-    all(() => sb.from("enrollments").select("id, program_id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active)")),
+    all(() => sb.from("enrollments").select("id, program_id, learner_id, due_date_override, enrolled_at, learner:profiles(full_name, email, is_active, department, designation, market, manager)")),
     all(() => sb.from("v_enrollment_progress").select("*")),
     all(() => sb.from("program_steps").select("id, program_id, position, step_type, title, is_required, passing_score").order("position")),
     all(() => sb.from("step_progress").select("enrollment_id, step_id, status, score, started_at, completed_at")),
@@ -36,7 +41,7 @@ async function loadData() {
     all(() => sb.from("uploads").select("enrollment_id, step_id, file_name, status, uploaded_at, reviewed_at, review_comment, reviewer:profiles!uploads_reviewed_by_fkey(full_name)")),
     all(() => sb.from("message_threads").select("id, program_id, status")),
     all(() => sb.from("enrollment_exclusions").select("enrollment_id, step_id")),
-    all(() => sb.from("survey_responses").select("step_id, answers, submitted_at")),
+    all(() => sb.from("survey_responses").select("step_id, respondent_id, answers, submitted_at")),
     all(() => sb.from("assessment_questions").select("id, step_id, qtype").in("qtype", ["rating", "likert", "nps"])),
   ]);
   return { programs, enrollments, progress, steps, stepProgress, attempts, uploads, threads, exclusions, responses, scaleQs };
@@ -92,7 +97,8 @@ function compute(d) {
     (filters.program ? p.id === filters.program : p.status !== "archived") &&
     (!filters.type || p.program_type === filters.type));
   const programById = Object.fromEntries(programs.map((p) => [p.id, p]));
-  const enrollments = d.enrollments.filter((e) => programById[e.program_id]);
+  const matches = (e) => Object.keys(GROUPS).every((k) => !filters[k] || (e.learner[k] || NOT_SET) === filters[k]);
+  const enrollments = d.enrollments.filter((e) => programById[e.program_id] && matches(e));
   const enrollmentById = Object.fromEntries(enrollments.map((e) => [e.id, e]));
   const pctByEnrollment = Object.fromEntries(d.progress.map((p) => [p.enrollment_id, p]));
   const steps = d.steps.filter((s) => programById[s.program_id]);
@@ -104,7 +110,9 @@ function compute(d) {
   // Steps L&D removed for individual learners
   const removed = new Set(d.exclusions.map((x) => `${x.enrollment_id}:${x.step_id}`));
   const assigned = (s) => enrollments.filter((e) => e.program_id === s.program_id && !removed.has(`${e.id}:${s.id}`)).length;
-  const responses = d.responses.filter((r) => stepById[r.step_id]);
+  // With a market / department / manager filter on, only named answers from those learners can count
+  const inView = new Set(enrollments.map((e) => e.learner_id));
+  const responses = d.responses.filter((r) => stepById[r.step_id] && (!peopleFiltered() || inView.has(r.respondent_id)));
 
   // --- Learners (one row per enrolment) ---
   const learners = enrollments.map((e) => {
@@ -119,7 +127,8 @@ function compute(d) {
       : dueMs && dueMs - Date.now() <= 7 * DAY ? "Due Soon"
       : stepProgress.some((s) => s.enrollment_id === e.id) ? "In Progress" : "Not Started";
     return {
-      name: e.learner.full_name, email: e.learner.email, program: program.title, programId: program.id,
+      name: e.learner.full_name, email: e.learner.email, program: program.title, programId: program.id, learnerId: e.learner_id,
+      department: e.learner.department || "", designation: e.learner.designation || "", market: e.learner.market || "", manager: e.learner.manager || "",
       pct, done: p.completed_steps ?? 0, total: p.required_steps ?? 0, due, status,
       avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
       lastActivity: p.last_activity, extended: !!e.due_date_override,
@@ -141,6 +150,29 @@ function compute(d) {
       rating: fb.rating, nps: fb.nps,
     };
   });
+
+  // --- By department / market / manager ---
+  const groupRows = Object.fromEntries(Object.keys(GROUPS).map((k) => {
+    const byValue = new Map();
+    for (const l of learners) {
+      const v = l[k] || NOT_SET;
+      if (!byValue.has(v)) byValue.set(v, []);
+      byValue.get(v).push(l);
+    }
+    const rows = [...byValue.entries()].map(([name, rows]) => {
+      const scores = rows.map((r) => r.avgScore).filter((x) => x != null);
+      return {
+        name, learners: new Set(rows.map((r) => r.learnerId)).size, enrolments: rows.length,
+        avgPct: Math.round(rows.reduce((a, r) => a + r.pct, 0) / rows.length),
+        completed: rows.filter((r) => r.status === "Completed").length,
+        inProgress: rows.filter((r) => r.status === "In Progress" || r.status === "Due Soon").length,
+        notStarted: rows.filter((r) => r.status === "Not Started").length,
+        overdue: rows.filter((r) => r.status === "Overdue").length,
+        avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+      };
+    }).sort((a, b) => (a.name === NOT_SET) - (b.name === NOT_SET) || b.enrolments - a.enrolments || a.name.localeCompare(b.name));
+    return [k, rows];
+  }));
 
   // --- Steps (module-wise) ---
   const stepRows = steps.map((s) => {
@@ -171,7 +203,7 @@ function compute(d) {
     { label: "Average Rating", value: fmtRating(fbPeriod.rating), hint: "star questions in surveys" },
     { label: "Recommendation Score", value: fmtNps(fbPeriod.nps), hint: "NPS, from −100 to +100" },
     { label: "Agreement", value: fbPeriod.agree == null ? "–" : `${fbPeriod.agree}%`, hint: "answered Agree or Strongly Agree" },
-    { label: "Survey Responses", value: fbPeriod.responses, hint: surveyAssigned ? `${Math.round((surveyDone / surveyAssigned) * 100)}% of learners have answered` : "no surveys yet" },
+    { label: "Survey Responses", value: fbPeriod.responses, hint: peopleFiltered() ? "named answers only (filtered)" : surveyAssigned ? `${Math.round((surveyDone / surveyAssigned) * 100)}% of learners have answered` : "no surveys yet" },
   ];
   const surveyRows = surveySteps.map((s) => {
     const fb = feedbackOf(responses.filter((r) => r.step_id === s.id), d.scaleQs);
@@ -235,7 +267,7 @@ function compute(d) {
       uploaded: u.uploaded_at, reviewedBy: u.reviewer?.full_name ?? "", reviewed: u.reviewed_at, comment: u.review_comment ?? "" };
   });
 
-  return { kpis, feedback, surveyRows, trend, programRows, learners, stepRows, attemptRows, uploadRows, start, statusMix, attention, summary };
+  return { kpis, feedback, surveyRows, trend, programRows, groupRows, learners, stepRows, attemptRows, uploadRows, start, statusMix, attention, summary };
 }
 
 // Count completions per day / week / month, depending on the period
@@ -294,19 +326,29 @@ export async function renderDashboard(main, ctx) {
     <header class="topbar">
       <div><h1>Dashboard</h1><p>Progress, completions and scores across your programs.</p></div>
       <div class="top-actions">
-        <button class="btn" data-excel>${icons.download} Export Excel</button>
-        <button class="btn primary" data-pdf>${icons.download} PDF Report</button>
+        <div class="seg seg-sm" role="group" aria-label="Period">
+          ${Object.entries(PERIODS).map(([k, l]) => `<button type="button" data-period="${k}" class="${k === filters.period ? "on" : ""}">${l}</button>`).join("")}
+        </div>
+        <div class="menu export-menu">
+          <button class="btn sm subtle" data-export aria-haspopup="true">${icons.download} Export <span class="caret">▾</span></button>
+          <div class="menu-list">
+            <button data-excel><b>Excel Workbook</b><span>Every table, one sheet each</span></button>
+            <button data-pdf><b>PDF Report</b><span>A formatted summary to share</span></button>
+          </div>
+        </div>
       </div>
     </header>
-    <div class="toolbar">
-      <div class="seg" role="group" aria-label="Period">
-        ${Object.entries(PERIODS).map(([k, l]) => `<button type="button" data-period="${k}" class="${k === filters.period ? "on" : ""}">${l}</button>`).join("")}
+    <div class="filter-bar">
+      <span class="filter-label">${icons.filter}Filter</span>
+      <div class="filter-chips">
+        <select class="chip-select" data-f="program" aria-label="Program"><option value="">All Programs</option></select>
+        <select class="chip-select" data-f="type" aria-label="Program type">
+          <option value="">All Types</option>
+          ${Object.entries(PROGRAM_TYPE).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}
+        </select>
+        ${Object.keys(GROUPS).map((k) => `<select class="chip-select" data-f="${k}" aria-label="${GROUPS[k]}"></select>`).join("")}
+        <button type="button" class="clear-filters" data-clear hidden>Clear Filters</button>
       </div>
-      <select class="select" data-f="program"><option value="">All Programs (Not Archived)</option></select>
-      <select class="select" data-f="type">
-        <option value="">All Types</option>
-        ${Object.entries(PROGRAM_TYPE).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}
-      </select>
     </div>
     <div id="dash"><div class="empty"><div>Loading…</div></div></div>`;
 
@@ -321,22 +363,41 @@ export async function renderDashboard(main, ctx) {
   const programSelect = main.querySelector('[data-f="program"]');
   programSelect.insertAdjacentHTML("beforeend", data.programs.map((p) =>
     `<option value="${p.id}">${esc(p.title)}${p.status === "archived" ? " (Archived)" : ""}</option>`).join(""));
+  programSelect.title = "All programs except archived ones";
   programSelect.value = data.programs.some((p) => p.id === filters.program) ? filters.program : "";
   main.querySelector('[data-f="type"]').value = filters.type;
+  for (const k of Object.keys(GROUPS)) {
+    const used = [...new Set(data.enrollments.map((e) => e.learner[k] || NOT_SET))].sort((a, b) => (a === NOT_SET) - (b === NOT_SET) || a.localeCompare(b));
+    const el = main.querySelector(`[data-f="${k}"]`);
+    el.innerHTML = `<option value="">${ALL_LABEL[k]}</option>${used.map((v) => `<option>${esc(v)}</option>`).join("")}`;
+    if (!used.includes(filters[k])) filters[k] = "";
+    el.value = filters[k];
+  }
 
   let view;
+  const chips = [...main.querySelectorAll("[data-f]")];
+  const clear = main.querySelector("[data-clear]");
   const draw = () => {
+    chips.forEach((el) => el.classList.toggle("active", !!el.value));
+    clear.hidden = !chips.some((el) => el.value);
     view = compute(data);
     drawDashboard(main.querySelector("#dash"), view);
   };
-  main.querySelectorAll("[data-f]").forEach((el) => el.addEventListener("input", () => { filters[el.dataset.f] = el.value; draw(); }));
+  chips.forEach((el) => el.addEventListener("input", () => { filters[el.dataset.f] = el.value; draw(); }));
+  clear.addEventListener("click", () => { chips.forEach((el) => { el.value = ""; filters[el.dataset.f] = ""; }); draw(); });
+
+  // Export menu
+  const exportMenu = main.querySelector(".export-menu");
+  const exportBtn = main.querySelector("[data-export]");
+  exportBtn.addEventListener("click", (e) => { e.stopPropagation(); exportMenu.classList.toggle("open"); });
+  document.addEventListener("click", (e) => { if (!exportMenu.contains(e.target)) exportMenu.classList.remove("open"); });
   main.querySelectorAll("[data-period]").forEach((b) => b.addEventListener("click", () => {
     filters.period = b.dataset.period;
     main.querySelectorAll("[data-period]").forEach((x) => x.classList.toggle("on", x === b));
     draw();
   }));
-  main.querySelector("[data-excel]").addEventListener("click", (e) => runExport(e.currentTarget, () => exportExcel(view, data, ctx.me)));
-  main.querySelector("[data-pdf]").addEventListener("click", (e) => runExport(e.currentTarget, () => exportPdf(view, data, ctx.me)));
+  main.querySelector("[data-excel]").addEventListener("click", () => { exportMenu.classList.remove("open"); runExport(exportBtn, () => exportExcel(view, data, ctx.me)); });
+  main.querySelector("[data-pdf]").addEventListener("click", () => { exportMenu.classList.remove("open"); runExport(exportBtn, () => exportPdf(view, data, ctx.me)); });
   draw();
 }
 
@@ -452,6 +513,49 @@ function attentionCard(v) {
     </div>`;
 }
 
+function completionBars(v) {
+  if (filters.groupBy === "program") {
+    return v.programRows.length ? `<div class="prog-bars">${v.programRows.map((p) => `
+      <a class="prog-bar" href="#/programs/${p.id}/learners">
+        <span class="prog-bar-top"><strong title="${esc(p.title)}">${esc(p.title)}</strong><b>${p.avgPct}%</b></span>
+        <span class="hbar-track"><i style="width:${p.avgPct}%"></i></span>
+        <span class="muted small">${plural(p.learners, "learner")} · ${p.completed} completed${p.avgScore != null ? ` · avg. score ${p.avgScore}%` : ""}</span>
+      </a>`).join("")}</div>` : '<p class="muted">No programs in view.</p>';
+  }
+  const rows = v.groupRows[filters.groupBy];
+  return rows.length ? `<div class="prog-bars">${rows.map((g) => `
+    <button type="button" class="prog-bar" data-pick="${esc(g.name)}" title="Show only ${esc(g.name)}">
+      <span class="prog-bar-top"><strong>${esc(g.name)}</strong><b>${g.avgPct}%</b></span>
+      <span class="hbar-track"><i style="width:${g.avgPct}%"></i></span>
+      <span class="muted small">${plural(g.learners, "learner")} · ${g.completed} completed${g.overdue ? ` · ${g.overdue} overdue` : ""}</span>
+    </button>`).join("")}</div>` : '<p class="muted">No learners in view.</p>';
+}
+
+// Each designation as a bar split by learner status, with completion and score beside it
+function designationCard(v) {
+  const rows = v.groupRows.designation;
+  const parts = [["completed", "Completed"], ["inProgress", "In Progress"], ["overdue", "Overdue"], ["notStarted", "Not Started"]];
+  const color = { completed: STATUS_COLOR.Completed, inProgress: STATUS_COLOR["In Progress"], overdue: STATUS_COLOR.Overdue, notStarted: STATUS_COLOR["Not Started"] };
+  const most = Math.max(1, ...rows.map((r) => r.enrolments));
+  return `
+    <div class="card span3 desig-card">
+      <div class="card-head"><h2>By Designation</h2>
+        <div class="desig-legend">${parts.map(([k, l]) => `<span><i style="background:${color[k]}"></i>${l}</span>`).join("")}</div>
+      </div>
+      ${rows.length ? `
+        <div class="desig-head"><span>Designation</span><span>Learners By Status</span><span>Completion</span><span>Avg. Score</span></div>
+        <div class="desig-rows">${rows.map((g) => `
+          <button type="button" class="desig-row" data-pick-desig="${esc(g.name)}" title="Show only ${esc(g.name)}">
+            <span class="desig-name"><strong>${esc(g.name)}</strong><span>${plural(g.learners, "learner")}</span></span>
+            <span class="stack" style="width:${Math.max(18, (g.enrolments / most) * 100)}%">${parts.filter(([k]) => g[k]).map(([k, l]) =>
+              `<i style="flex:${g[k]};background:${color[k]}" title="${l}: ${g[k]}">${g[k]}</i>`).join("")}</span>
+            <span class="desig-pct"><span class="ring-mini" style="--p:${g.avgPct}"></span><b>${g.avgPct}%</b></span>
+            <span class="desig-score">${g.avgScore == null ? '<span class="muted">–</span>' : `<b>${g.avgScore}%</b>`}</span>
+          </button>`).join("")}</div>`
+        : '<p class="muted">No learners in view.</p>'}
+    </div>`;
+}
+
 function drawDashboard(box, v) {
   const s = v.summary;
   const tiles = [
@@ -497,21 +601,20 @@ function drawDashboard(box, v) {
         ${statusDonut(v.statusMix)}
       </div>
       <div class="card">
-        <div class="card-head"><h2>Completion By Program</h2><span class="muted small">Average of all learners</span></div>
-        ${v.programRows.length ? `<div class="prog-bars">${v.programRows.map((p) => `
-          <a class="prog-bar" href="#/programs/${p.id}/learners">
-            <span class="prog-bar-top"><strong title="${esc(p.title)}">${esc(p.title)}</strong><b>${p.avgPct}%</b></span>
-            <span class="hbar-track"><i style="width:${p.avgPct}%"></i></span>
-            <span class="muted small">${plural(p.learners, "learner")} · ${p.completed} completed${p.avgScore != null ? ` · avg. score ${p.avgScore}%` : ""}</span>
-          </a>`).join("")}</div>`
-          : '<p class="muted">No programs in view.</p>'}
+        <div class="card-head"><h2>Completion By ${filters.groupBy === "program" ? "Program" : GROUPS[filters.groupBy] === "Reporting Manager" ? "Manager" : GROUPS[filters.groupBy]}</h2><span class="muted small">Average of all learners</span></div>
+        <div class="seg mini-seg" role="group" aria-label="Group by">
+          ${[["program", "Program"], ["market", "Market"], ["department", "Department"], ["manager", "Manager"]].map(([k, l]) =>
+            `<button type="button" data-group="${k}" class="${filters.groupBy === k ? "on" : ""}">${l}</button>`).join("")}
+        </div>
+        ${completionBars(v)}
       </div>
       ${feedbackCard(s)}
       ${attentionCard(v)}
+      ${designationCard(v)}
     </div>
 
     <div class="tabs" style="margin-top:22px">
-      ${[["programs", "By Program"], ["learners", "By Learner"], ["steps", "By Step"]].map(([k, l]) =>
+      ${[["programs", "By Program"], ["learners", "By Learner"], ["department", "By Department"], ["designation", "By Designation"], ["market", "By Market"], ["manager", "By Manager"], ["steps", "By Step"]].map(([k, l]) =>
         `<a href="#" data-view="${k}" class="${filters.view === k ? "active" : ""}">${l}</a>`).join("")}
     </div>
     <div id="dash-table"></div>`;
@@ -522,10 +625,40 @@ function drawDashboard(box, v) {
     box.querySelectorAll("[data-view]").forEach((x) => x.classList.toggle("active", x === a));
     drawTable(box.querySelector("#dash-table"), v);
   }));
+  box.querySelectorAll("[data-group]").forEach((b) => b.addEventListener("click", () => {
+    filters.groupBy = b.dataset.group;
+    drawDashboard(box, v);
+  }));
+  box.querySelectorAll("[data-pick]").forEach((b) => b.addEventListener("click", () => pickGroup(filters.groupBy, b.dataset.pick)));
+  box.querySelectorAll("[data-pick-desig]").forEach((b) => b.addEventListener("click", () => pickGroup("designation", b.dataset.pickDesig)));
   drawTable(box.querySelector("#dash-table"), v);
 }
 
+// Clicking a market / department / manager narrows the whole dashboard to it
+function pickGroup(key, value) {
+  const el = document.querySelector(`[data-f="${key}"]`);
+  if (!el) return;
+  el.value = value;
+  el.dispatchEvent(new Event("input"));
+}
+
 function drawTable(el, v) {
+  if (GROUPS[filters.view]) {
+    const rows = v.groupRows[filters.view];
+    el.innerHTML = rows.length ? `
+      <div class="table-wrap"><table class="data clickable">
+        <thead><tr><th>${GROUPS[filters.view]}</th><th>Learners</th><th>Enrolments</th><th>Avg. Completion</th><th>Completed</th><th>In Progress</th><th>Overdue</th><th>Avg. Score</th></tr></thead>
+        <tbody>${rows.map((g) => `
+          <tr data-pick="${esc(g.name)}"><td class="name"><strong>${esc(g.name)}</strong></td><td>${g.learners}</td><td>${g.enrolments}</td>
+            <td>${meter(g.avgPct)}</td><td>${g.completed}</td><td>${g.inProgress}</td>
+            <td>${g.overdue ? `<span class="pill crit">${g.overdue}</span>` : 0}</td><td>${pct(g.avgScore)}</td></tr>`).join("")}</tbody>
+      </table></div>
+      <p class="muted small" style="margin-top:8px">Click a row to see only those learners across the whole dashboard.</p>`
+      : '<div class="empty"><div><strong>No Learners In View</strong>Enroll learners in a program first.</div></div>';
+    el.querySelectorAll("[data-pick]").forEach((r) => r.addEventListener("click", () => pickGroup(filters.view, r.dataset.pick)));
+    return;
+  }
+
   if (filters.view === "programs") {
     el.innerHTML = v.programRows.length ? `
       <div class="table-wrap"><table class="data clickable">
@@ -546,18 +679,20 @@ function drawTable(el, v) {
 
   if (filters.view === "learners") {
     el.innerHTML = `
-      <div class="toolbar"><input class="input search" type="search" placeholder="Search learner" value="${esc(filters.q)}" data-q><span class="count"></span></div>
+      <div class="toolbar"><input class="input search" type="search" placeholder="Search learner, department, market, manager" value="${esc(filters.q)}" data-q><span class="count"></span></div>
       <div data-rows></div>`;
     const rows = el.querySelector("[data-rows]");
     const drawRows = () => {
       const q = filters.q.trim().toLowerCase();
-      const shown = v.learners.filter((l) => !q || `${l.name} ${l.email} ${l.program}`.toLowerCase().includes(q));
+      const shown = v.learners.filter((l) => !q || `${l.name} ${l.email} ${l.program} ${l.department} ${l.market} ${l.manager}`.toLowerCase().includes(q));
       el.querySelector(".count").textContent = `${shown.length} of ${v.learners.length}`;
       rows.innerHTML = shown.length ? `
         <div class="table-wrap"><table class="data">
-          <thead><tr><th>Learner</th><th>Program</th><th>Progress</th><th>Status</th><th>Due Date</th><th>Avg. Score</th><th>Last Activity</th></tr></thead>
+          <thead><tr><th>Learner</th><th>Department</th><th>Market</th><th>Reporting Manager</th><th>Program</th><th>Progress</th><th>Status</th><th>Due Date</th><th>Avg. Score</th><th>Last Activity</th></tr></thead>
           <tbody>${shown.map((l) => `
             <tr><td class="name"><strong>${esc(l.name)}</strong><span>${esc(l.email)}</span></td>
+              <td class="name"><strong>${esc(l.department || "–")}</strong><span>${esc(l.designation)}</span></td>
+              <td>${esc(l.market || "–")}</td><td>${esc(l.manager || "–")}</td>
               <td>${esc(l.program)}</td><td>${meter(l.pct)} <span class="muted small">(${l.done}/${l.total})</span></td>
               <td><span class="pill ${STATUS_PILL[l.status]}">${l.status}</span></td>
               <td>${esc(fmtDate(l.due))}${l.extended ? ' <span class="pill warn">Extended</span>' : ""}</td>
@@ -588,7 +723,11 @@ function filterSummary(data) {
   return [
     ["Period", PERIODS[filters.period]],
     ["Program", program ? program.title : "All Programs (Not Archived)"],
+    ["Designation", filters.designation || "All Designations"],
     ["Type", filters.type ? PROGRAM_TYPE[filters.type] : "All Types"],
+    ["Market", filters.market || "All Markets"],
+    ["Department", filters.department || "All Departments"],
+    ["Reporting Manager", filters.manager || "All Managers"],
   ];
 }
 
@@ -629,10 +768,18 @@ async function exportExcel(v, data, me) {
   })) : [["No surveys yet."]], [32, 32, 16, 11, 15, 18, 8, 12]);
 
   sheet("Learners", v.learners.map((l) => ({
-    Learner: l.name, Email: l.email, Program: l.program, "Completion %": l.pct, "Steps Done": l.done, "Steps Required": l.total,
+    Learner: l.name, Email: l.email, Department: l.department, Designation: l.designation, Market: l.market, "Reporting Manager": l.manager,
+    Program: l.program, "Completion %": l.pct, "Steps Done": l.done, "Steps Required": l.total,
     Status: l.status, "Due Date": xDate(l.due), "Deadline Extended": l.extended ? "Yes" : "No",
     "Average Score %": l.avgScore ?? "", "Last Activity": xDate(l.lastActivity),
-  })), [26, 32, 32, 13, 11, 14, 13, 12, 17, 16, 18]);
+  })), [26, 32, 20, 20, 13, 22, 32, 13, 11, 14, 13, 12, 17, 16, 18]);
+
+  for (const [k, label] of Object.entries(GROUPS)) {
+    sheet(`By ${label === "Reporting Manager" ? "Manager" : label}`, v.groupRows[k].length ? v.groupRows[k].map((g) => ({
+      [label]: g.name, Learners: g.learners, Enrolments: g.enrolments, "Average Completion %": g.avgPct,
+      Completed: g.completed, "In Progress": g.inProgress, Overdue: g.overdue, "Average Score %": g.avgScore ?? "",
+    })) : [["No learners in view."]], [28, 10, 12, 20, 11, 12, 9, 16]);
+  }
 
   sheet("Steps", v.stepRows.map((s) => ({
     Program: s.program, "#": s.position, Step: s.title, Type: s.type, Required: s.required ? "Yes" : "No",
@@ -687,7 +834,7 @@ async function exportPdf(v, data, me) {
   doc.setFont("helvetica", "normal");
   doc.setFontSize(11);
   doc.setTextColor(200, 220, 232);
-  doc.text(`${scope}  |  ${PERIODS[filters.period]}${filters.type ? `  |  ${PROGRAM_TYPE[filters.type]}` : ""}`, M, 74);
+  doc.text([scope, PERIODS[filters.period], filters.type && PROGRAM_TYPE[filters.type], filters.market, filters.department, filters.designation, filters.manager && `Manager: ${filters.manager}`].filter(Boolean).join("  |  "), M, 74);
   doc.text(`Generated ${generated} by ${me.full_name}`, M, 92);
 
   // KPI tiles (4 x 2)
@@ -825,9 +972,15 @@ async function exportPdf(v, data, me) {
   table("Programs", ["Program", "Type", "Status", "Learners", "Avg. Completion", "Completed", "Overdue", "Avg. Score", "Rating", "NPS"],
     v.programRows.map((p) => [p.title, p.type, PROGRAM_STATUS[p.status].label, p.learners, `${p.avgPct}%`, p.completed, p.overdue, fmt(p.avgScore), p.rating == null ? "–" : `${p.rating}/5`, fmtNps(p.nps)]),
     { 0: { cellWidth: 150 } });
-  table("Learners", ["Learner", "Program", "Progress", "Status", "Due Date", "Avg. Score", "Last Activity"],
-    v.learners.map((l) => [`${l.name}\n${l.email}`, l.program, `${l.pct}% (${l.done}/${l.total})`, l.status, fmtDate(l.due), fmt(l.avgScore), fmtDate(l.lastActivity)]),
-    { 0: { cellWidth: 130 } });
+  for (const [k, label] of Object.entries(GROUPS)) {
+    table(`By ${label === "Reporting Manager" ? "Manager" : label}`, [label, "Learners", "Enrolments", "Avg. Completion", "Completed", "In Progress", "Overdue", "Avg. Score"],
+      v.groupRows[k].map((g) => [g.name, g.learners, g.enrolments, `${g.avgPct}%`, g.completed, g.inProgress, g.overdue, fmt(g.avgScore)]),
+      { 0: { cellWidth: 140 } });
+  }
+  table("Learners", ["Learner", "Department / Market", "Manager", "Program", "Progress", "Status", "Due Date", "Score"],
+    v.learners.map((l) => [`${l.name}\n${l.email}`, [l.department, l.designation, l.market].filter(Boolean).join("\n") || "–", l.manager || "–", l.program,
+      `${l.pct}% (${l.done}/${l.total})`, l.status, fmtDate(l.due), fmt(l.avgScore)]),
+    { 0: { cellWidth: 110 } });
   table("Steps", ["Program", "Step", "Type", "Completed", "Rate", "Avg. Score", "Pass Rate"],
     v.stepRows.map((s) => [s.program, `${s.position}. ${s.title}`, s.type, `${s.completed} / ${s.enrolled}`, `${s.rate}%`, fmt(s.avgScore), fmt(s.passRate)]),
     { 1: { cellWidth: 150 } });

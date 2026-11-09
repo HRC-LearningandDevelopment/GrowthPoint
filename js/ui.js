@@ -119,6 +119,19 @@ export const safeName = (s) => String(s ?? "").replace(/[\\/:*?"<>|]+/g, "-").re
 
 export const ROLE_LABEL = { admin: "Admin", ld: "L&D", learner: "Learner" };
 
+// Learner details used for reporting
+export const MARKETS = ["US", "Sri Lanka", "India", "Philippines"];
+export const DETAIL_LABEL = { department: "Department", designation: "Designation", market: "Market", manager: "Reporting Manager" };
+const MARKET_ALIASES = { usa: "US", "united states": "US", us: "US", "sri lanka": "Sri Lanka", srilanka: "Sri Lanka", lk: "Sri Lanka", sl: "Sri Lanka",
+  india: "India", in: "India", ind: "India", philippines: "Philippines", ph: "Philippines", phl: "Philippines", phils: "Philippines" };
+// "usa", "PH", "philippines " → the standard spelling; anything else is kept as typed
+export const cleanMarket = (v) => {
+  const t = String(v ?? "").trim().replace(/\s+/g, " ");
+  if (!t) return "";
+  return MARKET_ALIASES[t.toLowerCase()]
+    ?? (t.length <= 3 ? t.toUpperCase() : t.replace(/\b\w/g, (c) => c.toUpperCase()));
+};
+
 export const PROGRAM_TYPE = { self_paced: "Self-Paced", ilt: "ILT", blended: "Blended" };
 
 export const PROGRAM_STATUS = {
@@ -197,6 +210,7 @@ export const icons = {
   messages: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.9A8 8 0 1 1 21 12z"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>',
   archive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg>',
+  filter: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16l-6 7.5V19l-4 1.5v-8z"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
   calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>',
   flag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></svg>',
