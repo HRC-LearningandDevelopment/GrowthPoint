@@ -75,9 +75,9 @@ export async function renderFormBuilder(main, program, stepId) {
         <p>${isQuiz ? "Add sections and questions, mark the correct answers and set the points." : "Add sections and questions. Learners answer inside GrowthPoint."}</p>
       </div>
       <div class="top-actions">
-        <button class="btn" data-template>${icons.download} Download Template</button>
-        <label class="btn">${icons.upload} Import From Template<input type="file" accept=".xlsx,.xls,.csv" data-import hidden></label>
-        <a class="btn" href="#/preview/new/${program.id}/${kind}/${step.id}">${icons.eye} Preview</a>
+        <button class="btn sm subtle" data-template>${icons.download} Download Template</button>
+        <label class="btn sm subtle">${icons.upload} Import From Template<input type="file" accept=".xlsx,.xls,.csv" data-import hidden></label>
+        <a class="btn sm subtle" href="#/preview/new/${program.id}/${kind}/${step.id}">${icons.eye} Preview</a>
         <button class="btn primary" data-save>Save</button>
       </div>
     </header>

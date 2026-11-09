@@ -469,7 +469,7 @@ function feedbackCard(s) {
       <div class="fb-row">
         <div class="fb-label"><span>Recommendation Score (NPS)</span><b>${fmtNps(fb.nps)}</b></div>
         <div class="nps-track"><i style="left:${npsPos}%"${fb.nps == null ? ' hidden' : ""}></i></div>
-        <div class="nps-scale"><span>−100</span><span>0</span><span>+100</span></div>
+        <div class="nps-ticks"><span>−100</span><span>0</span><span>+100</span></div>
       </div>
       <div class="fb-row">
         <div class="fb-label"><span>Agree Or Strongly Agree</span><b>${fb.agree == null ? "–" : `${fb.agree}%`}</b></div>
@@ -547,7 +547,7 @@ function designationCard(v) {
         <div class="desig-rows">${rows.map((g) => `
           <button type="button" class="desig-row" data-pick-desig="${esc(g.name)}" title="Show only ${esc(g.name)}">
             <span class="desig-name"><strong>${esc(g.name)}</strong><span>${plural(g.learners, "learner")}</span></span>
-            <span class="stack" style="width:${Math.max(18, (g.enrolments / most) * 100)}%">${parts.filter(([k]) => g[k]).map(([k, l]) =>
+            <span class="desig-stack" style="width:${Math.max(18, (g.enrolments / most) * 100)}%">${parts.filter(([k]) => g[k]).map(([k, l]) =>
               `<i style="flex:${g[k]};background:${color[k]}" title="${l}: ${g[k]}">${g[k]}</i>`).join("")}</span>
             <span class="desig-pct"><span class="ring-mini" style="--p:${g.avgPct}"></span><b>${g.avgPct}%</b></span>
             <span class="desig-score">${g.avgScore == null ? '<span class="muted">–</span>' : `<b>${g.avgScore}%</b>`}</span>
