@@ -22,7 +22,8 @@ const PAGES = {
   review:    { title: "Review Queue", icon: icons.review,    roles: STAFF,       render: renderReview, badge: "review" },
   messages:  { title: "Messages",     icon: icons.messages,  roles: [...STAFF, "learner"], render: renderMessages, badge: "messages" },
   people:    { title: "People",       icon: icons.people,    roles: STAFF,       render: renderPeople },
-  preview:   { title: "Learner View", icon: icons.eye,       roles: STAFF,       render: renderPreview },
+  // Opened from a program (Preview As Learner / View As Learner), not from the sidebar
+  preview:   { title: "Learner View", icon: icons.eye,       roles: STAFF,       render: renderPreview, hidden: true, navAs: "programs" },
 };
 
 const allowedPages = () => Object.entries(PAGES).filter(([, p]) => p.roles.includes(me.role));
@@ -189,7 +190,7 @@ async function saveNewPassword(form) {
 // The app shell (sidebar + page)
 // ---------------------------------------------------------------------
 function showApp() {
-  const nav = allowedPages()
+  const nav = allowedPages().filter(([, p]) => !p.hidden)
     .map(([key, p]) => `<a href="#/${key}" data-page="${key}">${p.icon}<span>${esc(p.title)}</span>${p.badge ? `<b class="count" data-badge="${p.badge}" hidden></b>` : ""}</a>`)
     .join("");
 
@@ -230,7 +231,7 @@ function route() {
   const [key, page] = found ?? pages[0];
   if (!found) history.replaceState(null, "", `#/${key}`);
 
-  root.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === key));
+  root.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === (page.navAs ?? key)));
   document.title = `${page.title} · GrowthPoint`;
   page.render(main, { me, params: found ? params.map(decodeURIComponent) : [] });
   refreshBadges();

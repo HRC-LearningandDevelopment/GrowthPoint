@@ -4,9 +4,9 @@
 //   #/home/<program>/module/<step>  module inside GrowthPoint
 //   #/home/<program>/assessment/<step>
 //
-// Admin and L&D get the same pages read-only under "Learner view":
-//   #/preview/new/...          as a new learner (every program, welcome steps treated as done)
-//   #/preview/<learner id>/... as a specific learner, with their real progress
+// Admin and L&D open the same pages read-only from a program ("Preview As Learner"):
+//   #/preview/new/<program>/...          as a new learner (welcome steps treated as done)
+//   #/preview/<learner id>/<program>/... as an enrolled learner, with their real progress
 import { sb } from "../supabase.js";
 import { esc, toast, openModal, icons, stepIcon, fmtDate, fmtDateTime, PROGRAM_TYPE, STEP_TYPE, LIKERT } from "../ui.js";
 import { newMessage } from "./messages.js";
@@ -25,27 +25,40 @@ export async function renderLearning(main, ctx) {
 }
 
 export async function renderPreview(main, ctx) {
-  const [as = "new", ...rest] = ctx.params;
-  const { data: learners } = await sb.from("profiles").select("id, full_name")
-    .eq("role", "learner").order("full_name");
-  const viewed = (learners ?? []).find((l) => l.id === as);
+  const [as = "new", programId, ...rest] = ctx.params;
+  // The learner view always belongs to one program, opened from Programs
+  if (!programId) {
+    main.innerHTML = `
+      <header class="topbar"><div><h1>Learner View</h1><p>See a program exactly as a learner does.</p></div></header>
+      <div class="empty"><div><strong>Open A Program First</strong>Go to <b>Programs</b>, open a program and click <b>Preview As Learner</b>.
+        <div style="margin-top:12px"><a class="btn primary" href="#/programs">${icons.programs} Go To Programs</a></div></div></div>`;
+    return;
+  }
+  const [{ data: program }, { data: enrolled }] = await Promise.all([
+    sb.from("programs").select("id, title").eq("id", programId).maybeSingle(),
+    sb.from("enrollments").select("learner:profiles(id, full_name)").eq("program_id", programId),
+  ]);
+  const learners = [...new Map((enrolled ?? []).filter((e) => e.learner).map((e) => [e.learner.id, e.learner])).values()]
+    .sort((a, b) => a.full_name.localeCompare(b.full_name));
+  const viewed = learners.find((l) => l.id === as);
   const learnerId = viewed ? as : null;
   mode = { preview: true, base: `#/preview/${learnerId ?? "new"}`, learnerId, name: viewed?.full_name ?? "Learner" };
 
   main.innerHTML = `
     <div class="preview-bar">
+      <a class="btn sm" href="#/programs/${programId}">${icons.back} Back To Program</a>
       <span class="pill prog">Learner View</span>
-      <span>You're seeing GrowthPoint as a learner does. <b>Nothing you do here is saved.</b></span>
-      <label>View as
+      <span>${program ? `<b>${esc(program.title)}</b>: ` : ""}what a learner sees. <b>Nothing you do here is saved.</b></span>
+      <label>View As
         <select class="select" data-as>
-          <option value="new">A New Learner (Every Program)</option>
-          ${(learners ?? []).map((l) => `<option value="${l.id}" ${l.id === learnerId ? "selected" : ""}>${esc(l.full_name)}</option>`).join("")}
+          <option value="new">A New Learner</option>
+          ${learners.map((l) => `<option value="${l.id}" ${l.id === learnerId ? "selected" : ""}>${esc(l.full_name)}</option>`).join("")}
         </select>
       </label>
     </div>
     <div id="preview-body"></div>`;
-  main.querySelector("[data-as]").addEventListener("change", (e) => { location.hash = `#/preview/${e.target.value}`; });
-  return route(main.querySelector("#preview-body"), ctx, rest);
+  main.querySelector("[data-as]").addEventListener("change", (e) => { location.hash = `#/preview/${e.target.value}/${programId}`; });
+  return route(main.querySelector("#preview-body"), ctx, [programId, ...rest]);
 }
 
 function route(main, ctx, params) {
@@ -58,6 +71,9 @@ function route(main, ctx, params) {
 }
 
 const previewOnly = () => toast("This is the learner view. Nothing is saved here.");
+
+// Learners go back to My Learning; in the learner view the program page is the start
+const backLink = (cls) => mode.preview ? "" : `<a class="${cls}" href="${mode.base}">${icons.back} My Learning</a>`;
 
 // =====================================================================
 // Shared: load everything about one or more enrolments
@@ -280,7 +296,7 @@ async function programPage(main, ctx, programId) {
   }
   if (!e) {
     main.innerHTML = `
-      <header class="topbar"><div><a class="back-link" href="${mode.base}">${icons.back} My Learning</a><h1>Program Not Available</h1></div></header>
+      <header class="topbar"><div>${backLink("back-link")}<h1>Program Not Available</h1></div></header>
       <div class="empty"><div>You're not enrolled in this program, or it hasn't started yet.</div></div>`;
     return;
   }
@@ -305,7 +321,7 @@ async function programPage(main, ctx, programId) {
     : e.pct === 100 ? "Review Your Journey" : e.pct > 0 ? "Continue Your Journey" : "Start Your Journey";
 
   main.innerHTML = `<div data-root>
-    <a class="back-link page-back reveal" href="${mode.base}">${icons.back} My Learning</a>
+    ${backLink("back-link page-back reveal")}
 
     ${p.status === "draft" ? '<div class="notice info" style="margin-top:10px">This program is a draft. Learners can\'t see it until it\'s scheduled or live.</div>' : ""}
     ${p.status === "on_hold" ? '<div class="notice" style="margin-top:10px">This program is on hold. Steps are paused until the L&amp;D team resumes it.</div>' : ""}
